@@ -4123,3 +4123,23 @@ func TestCapabilityBoundaryEnforcement(t *testing.T) {
 		require.Equal(t, uint16(120), decoded.Time)
 	})
 }
+
+func Test_UnknownEvpnExtended_RoundTrip(t *testing.T) {
+	assert := assert.New(t)
+
+	// EVPN Extended Community with a Sub-Type this package does not parse
+	// (0x08, ARP/ND, RFC 9047), Router flag set.
+	raw := []byte{0x06, 0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+	e, err := ParseExtended(raw)
+	require.NoError(t, err)
+
+	unknown, ok := e.(*UnknownExtended)
+	require.True(t, ok, "expected *UnknownExtended")
+	assert.Equal(EC_TYPE_EVPN, unknown.Type)
+	assert.Equal(raw[1:], unknown.Value)
+
+	serialized, err := unknown.Serialize()
+	require.NoError(t, err)
+	assert.Equal(raw, serialized, "round-trip must be byte-for-byte identical")
+}
