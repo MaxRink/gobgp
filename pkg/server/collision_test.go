@@ -298,23 +298,26 @@ func TestCollisionBothConnectionsDropped(t *testing.T) {
 	require.Greater(t, took, 500*time.Millisecond, "GoBGP did not wait IdleHoldTimeAfterReset")
 }
 
-// readsEOF reports whether the next read on c ends the connection without a
-// BGP message: GoBGP must not answer a NOTIFICATION (RFC 4271 Section 8.2.2).
-func readsEOF(t *testing.T, c net.Conn) bool {
+// fsmErrorThenEOF reports whether GoBGP answers the peer's NOTIFICATION only
+// with FSM Error/Unexpected Message in OpenSent (RFC 4271 Section 8.2.2,
+// Event 25) and closes the connection.
+func fsmErrorThenEOF(t *testing.T, p *scriptedPeer, c net.Conn) bool {
 	t.Helper()
-	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
-	hdr := make([]byte, bgp.BGP_HEADER_LENGTH)
-	if _, err := io.ReadFull(c, hdr); err != nil {
-		return true
+	m := p.read(c)
+	n, ok := m.Body.(*bgp.BGPNotification)
+	if !ok || n.ErrorCode != bgp.BGP_ERROR_FSM_ERROR || n.ErrorSubcode != 1 {
+		t.Logf("GoBGP sent %v", m.Body)
+		return false
 	}
-	t.Logf("GoBGP sent message type %d after the peer's NOTIFICATION", hdr[18])
-	return false
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err := c.Read(make([]byte, 1))
+	return err != nil
 }
 
 // The peer sends a NOTIFICATION instead of its OPEN, as FRR does when it
 // resolves a collision on a connection where it has not sent its OPEN yet.
-// GoBGP closes that connection without an answer (no FSM error) and goes
-// on with the other connection, without the 5 s idle hold.
+// GoBGP answers it with the FSM Error of RFC 4271 Section 8.2.2, closes that
+// connection and goes on with the other one, without the 5 s idle hold.
 func TestNotificationInsteadOfOpen(t *testing.T) {
 	cease := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil)
 	for _, onIncoming := range []bool{true, false} {
@@ -358,7 +361,7 @@ func TestNotificationInsteadOfOpen(t *testing.T) {
 				// (b) The peer drops GoBGP's connection with a
 				// NOTIFICATION instead of its OPEN and opens its own.
 				p.write(a, cease)
-				require.True(t, readsEOF(t, a), "GoBGP answered the NOTIFICATION on its own connection")
+				require.True(t, fsmErrorThenEOF(t, p, a), "GoBGP's answer on its own connection")
 				b, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(gobgpPort)))
 				require.NoError(t, err)
 				t.Cleanup(func() { b.Close() })
@@ -375,7 +378,7 @@ func TestNotificationInsteadOfOpen(t *testing.T) {
 				t.Cleanup(func() { b.Close() })
 				p.expect(b, bgp.BGP_MSG_OPEN)
 				p.write(b, cease)
-				require.True(t, readsEOF(t, b), "GoBGP answered the NOTIFICATION on the peer's connection")
+				require.True(t, fsmErrorThenEOF(t, p, b), "GoBGP's answer on the peer's connection")
 				time.Sleep(20 * time.Millisecond)
 				p.write(a, p.open())
 				p.expect(a, bgp.BGP_MSG_KEEPALIVE)
