@@ -1627,6 +1627,16 @@ func (fsm *fsm) handleOpen(fmsg *fsmMsg) (bgp.FSMState, *fsmStateReason, *bgp.BG
 			}
 			return bgp.BGP_FSM_OPENCONFIRM, newfsmStateReason(fsmOpenMsgReceived, nil, nil), nil
 		}
+		if n, ok := m.Body.(*bgp.BGPNotification); ok {
+			// RFC 4271 Section 8.2.2: a NOTIFICATION in OpenSent closes
+			// the connection and gets no answer, for example Cease/
+			// Connection Collision Resolution from a peer that keeps
+			// the other connection.
+			fsm.logger.Info("received notification in OpenSent",
+				slog.Int("Code", int(n.ErrorCode)),
+				slog.Int("Subcode", int(n.ErrorSubcode)))
+			return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmNotificationRecv, n, nil), nil
+		}
 		notif := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_FSM_ERROR, 1, nil)
 		return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmInvalidMsg, notificationBody(notif), nil), notif
 	case *bgp.MessageError:
@@ -1686,6 +1696,10 @@ func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReaso
 					_ = fsm.sendNotification(fsm.conn, notif)
 				} else {
 					fsm.conn.Close()
+				}
+				if reason.Type == fsmNotificationRecv {
+					// The other connection may still come up.
+					return h.failedConn(reason)
 				}
 				return nextState, reason
 			}

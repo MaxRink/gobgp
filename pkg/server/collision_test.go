@@ -297,3 +297,92 @@ func TestCollisionBothConnectionsDropped(t *testing.T) {
 	require.Less(t, took, 3*time.Second, "GoBGP waited the fixed idle hold time")
 	require.Greater(t, took, 500*time.Millisecond, "GoBGP did not wait IdleHoldTimeAfterReset")
 }
+
+// readsEOF reports whether the next read on c ends the connection without a
+// BGP message: GoBGP must not answer a NOTIFICATION (RFC 4271 Section 8.2.2).
+func readsEOF(t *testing.T, c net.Conn) bool {
+	t.Helper()
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	hdr := make([]byte, bgp.BGP_HEADER_LENGTH)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		return true
+	}
+	t.Logf("GoBGP sent message type %d after the peer's NOTIFICATION", hdr[18])
+	return false
+}
+
+// The peer sends a NOTIFICATION instead of its OPEN, as FRR does when it
+// resolves a collision on a connection where it has not sent its OPEN yet.
+// GoBGP closes that connection without an answer (no FSM error) and goes
+// on with the other connection, without the 5 s idle hold.
+func TestNotificationInsteadOfOpen(t *testing.T) {
+	cease := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil)
+	for _, onIncoming := range []bool{true, false} {
+		name := "outgoing connection"
+		if onIncoming {
+			name = "incoming connection"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			lc := &net.ListenConfig{}
+			peerL, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
+			require.NoError(t, err)
+			t.Cleanup(func() { peerL.Close() })
+			l, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
+			require.NoError(t, err)
+			gobgpPort := l.Addr().(*net.TCPAddr).Port
+			require.NoError(t, l.Close())
+
+			s := NewBgpServer()
+			go s.Serve()
+			require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{
+				Asn: 65001, RouterId: "192.0.2.17", ListenPort: int32(gobgpPort), ListenAddresses: []string{"127.0.0.1"},
+			}}))
+			t.Cleanup(func() { _ = s.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+			p := &scriptedPeer{t: t, asn: 65002, id: netip.MustParseAddr("10.0.0.1")}
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+			require.NoError(t, s.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+				Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 65002},
+				Transport: &api.Transport{RemotePort: uint32(peerL.Addr().(*net.TCPAddr).Port)},
+				Timers:    &api.Timers{Config: &api.TimersConfig{ConnectAtOnce: true, IdleHoldTimeAfterReset: 1}},
+			}}))
+
+			// GoBGP's connection (A).
+			a, err := peerL.Accept()
+			require.NoError(t, err)
+			t.Cleanup(func() { a.Close() })
+			p.expect(a, bgp.BGP_MSG_OPEN)
+			start := time.Now()
+
+			if !onIncoming {
+				// (b) The peer drops GoBGP's connection with a
+				// NOTIFICATION instead of its OPEN and opens its own.
+				p.write(a, cease)
+				require.True(t, readsEOF(t, a), "GoBGP answered the NOTIFICATION on its own connection")
+				b, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(gobgpPort)))
+				require.NoError(t, err)
+				t.Cleanup(func() { b.Close() })
+				p.write(b, p.open())
+				p.expect(b, bgp.BGP_MSG_OPEN)
+				p.expect(b, bgp.BGP_MSG_KEEPALIVE)
+				p.write(b, bgp.NewBGPKeepAliveMessage())
+			} else {
+				// (a) The peer opens its own connection (B), gets
+				// GoBGP's OPEN there and drops it with a NOTIFICATION
+				// instead of its OPEN; it keeps GoBGP's connection.
+				b, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(gobgpPort)))
+				require.NoError(t, err)
+				t.Cleanup(func() { b.Close() })
+				p.expect(b, bgp.BGP_MSG_OPEN)
+				p.write(b, cease)
+				require.True(t, readsEOF(t, b), "GoBGP answered the NOTIFICATION on the peer's connection")
+				time.Sleep(20 * time.Millisecond)
+				p.write(a, p.open())
+				p.expect(a, bgp.BGP_MSG_KEEPALIVE)
+				p.write(a, bgp.NewBGPKeepAliveMessage())
+			}
+			w.Wait(t, 15*time.Second)
+			require.Less(t, time.Since(start), 2*time.Second, "GoBGP waited the idle hold time")
+		})
+	}
+}
