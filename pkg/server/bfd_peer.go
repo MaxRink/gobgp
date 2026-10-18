@@ -594,9 +594,9 @@ func (p *bfdPeer) remoteDown() {
 
 func (p *bfdPeer) resetPeer() {
 	if err := p.peerState.ResetPeer(context.Background(), &api.ResetPeerRequest{
-		Address:       p.peerAddress.String(),
-		Communication: "BFD is down",
-		Soft:          false,
+		Address: p.peerAddress.String(),
+		Soft:    false,
+		BfdDown: true,
 	}); err != nil {
 		p.logger.Warn("ResetPeer failed",
 			slog.String("Topic", "bfd"),

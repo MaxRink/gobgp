@@ -2231,6 +2231,13 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			}
 			return -1, newfsmStateReason(fsmDeConfigured, notificationBody(m), nil)
 		case m := <-fsm.notification:
+			if b := notificationBody(m); b.ErrorCode == bgp.BGP_ERROR_CEASE && b.ErrorSubcode == bgp.BGP_ERROR_SUB_BFD_DOWN {
+				// A reset because of BFD is a reset too, also when it
+				// goes out as Hard Reset.
+				fsm.lock.Lock()
+				fsm.idleHoldTime = fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset
+				fsm.lock.Unlock()
+			}
 			m = convertNotification(m)
 			_ = fsm.sendNotification(fsm.conn, m)
 			return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmNotificationSent, notificationBody(m), nil)

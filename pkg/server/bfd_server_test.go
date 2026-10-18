@@ -74,10 +74,12 @@ func eventuallyReceivesAfter(timeout time.Duration, s *bfdServer, peerAddress ne
 
 type mockPeerState struct {
 	resetPeerCount int64
+	bfdDown        atomic.Bool // of the last reset
 }
 
 // ResetPeer implements peerState.
 func (m *mockPeerState) ResetPeer(ctx context.Context, r *api.ResetPeerRequest) error {
+	m.bfdDown.Store(r.BfdDown)
 	atomic.AddInt64(&m.resetPeerCount, 1)
 	return nil
 }
@@ -472,6 +474,7 @@ func Test_ResetPeer(t *testing.T) {
 	s1.Stop()
 
 	assert.Equal(int64(1), atomic.LoadInt64(&m1.resetPeerCount))
+	assert.True(m1.bfdDown.Load(), "BFD resets the peer with Cease/BFD Down")
 }
 
 func Test_BgpAddDeletePeer(t *testing.T) {
