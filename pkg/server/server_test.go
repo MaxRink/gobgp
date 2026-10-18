@@ -6356,5 +6356,5 @@ func TestResetPeerBfdDown(t *testing.T) {
 		n := sentNotification(m)
 		return n != nil && n.ErrorCode == bgp.BGP_ERROR_CEASE && n.ErrorSubcode == bgp.BGP_ERROR_SUB_BFD_DOWN
 	}, 10*time.Second, 10*time.Millisecond)
-	require.Equal(t, peer.fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset, peer.fsm.idleHoldTime)
+	require.Equal(t, float64(2*idleHoldTimeInitial), peer.fsm.idleHoldTime)
 }
