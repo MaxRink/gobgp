@@ -5346,7 +5346,7 @@ func TestDeletePeerDropsPolicyAssignment(t *testing.T) {
 // startServerWithPassivePeer starts a BgpServer without a TCP listener and
 // adds one passive ipv4-unicast neighbor, so tests can drive sessions by
 // injecting MockConnections into the peer's FSM.
-func startServerWithPassivePeer(t *testing.T, asn uint32, peerAddr string) (*BgpServer, *peer) {
+func startServerWithPassivePeer(t *testing.T, asn uint32, peerAddr string, opts ...func(*oc.Neighbor)) (*BgpServer, *peer) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -5384,6 +5384,10 @@ func startServerWithPassivePeer(t *testing.T, asn uint32, peerAddr string) (*Bgp
 				},
 			},
 		},
+	}
+
+	for _, o := range opts {
+		o(neighbor)
 	}
 
 	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
@@ -5473,6 +5477,36 @@ func TestResetPeerWhileDownDoesNotResetNextSession(t *testing.T) {
 		return peer.State() != bgp.BGP_FSM_ESTABLISHED || sentNotification(m2) != nil
 	}, time.Second, 10*time.Millisecond)
 	require.Empty(t, peer.fsm.notification)
+}
+
+// A hard ResetPeer against a peer that is administratively down sets the
+// idle hold time after reset for its next start, as v3 did: after
+// EnablePeer the peer waits IdleHoldTimeAfterReset in Idle, not the fixed
+// holdtimeIdle (5 s).
+// https://github.com/osrg/gobgp/issues/3740
+func TestResetPeerWhileAdminDownAppliesIdleHoldTimeAfterReset(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.Timers.Config.IdleHoldTimeAfterReset = 1
+	})
+	ctx := context.Background()
+	establishSession(t, s, peer, asn, peerAddr)
+
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	require.NoError(t, s.DisablePeer(ctx, &api.DisablePeerRequest{Address: peerAddr}))
+	w.Wait(t, 10*time.Second)
+	require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, Communication: "BFD is down"}))
+	require.Eventually(t, func() bool { return len(peer.fsm.notification) == 0 }, 5*time.Second, 10*time.Millisecond)
+
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+	start := time.Now()
+	require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
+	w.Wait(t, 10*time.Second)
+	require.Less(t, time.Since(start), 3*time.Second, "idle hold time after reset (1 s) not applied")
 }
 
 // A hard ResetPeer against an established peer must still tear the session
