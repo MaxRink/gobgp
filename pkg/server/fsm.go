@@ -268,7 +268,9 @@ type outgoingConnManager struct {
 	state  fsmState
 }
 
-func newOutGoingConnManager(ctx context.Context, fsm *fsm) *outgoingConnManager {
+// newOutGoingConnManager starts connecting to the peer. With now the first
+// connect starts at once.
+func newOutGoingConnManager(ctx context.Context, fsm *fsm, now bool) *outgoingConnManager {
 	cctx, cancel := context.WithCancel(ctx)
 	ocm := &outgoingConnManager{
 		ctx:    cctx,
@@ -277,12 +279,12 @@ func newOutGoingConnManager(ctx context.Context, fsm *fsm) *outgoingConnManager 
 	}
 	ocm.state.Store(bgp.BGP_FSM_CONNECT)
 	ocm.wg.Add(1)
-	go ocm.run(fsm.outgoingConnCh)
+	go ocm.run(fsm.outgoingConnCh, now)
 
 	return ocm
 }
 
-func (ocm *outgoingConnManager) run(ch chan<- outgoingConn) {
+func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, first bool) {
 	defer func() {
 		ocm.wg.Done()
 		ocm.cancel()
@@ -297,10 +299,13 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn) {
 	}
 
 	var conn net.Conn
+	// Only the first connect may start at once; after a failed connection
+	// the retries wait as before.
 	for {
 		switch ocm.state.Load() {
 		case bgp.BGP_FSM_CONNECT:
-			conn = ocm.fsm.h.connectLoop(ocm.ctx)
+			conn = ocm.fsm.h.connectLoop(ocm.ctx, first)
+			first = false
 			if ocm.ctx.Err() != nil {
 				// right after connectLoop() returns a connection, the context may be canceled.
 				if conn != nil {
@@ -967,7 +972,11 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	}
 }
 
-func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
+// connectLoop connects to the peer. With now the first attempt starts at
+// once, like the Connect state of other implementations (FRR connects
+// when BGP_Start runs); otherwise, and for the retries, it waits a
+// jittered delay.
+func (h *fsmHandler) connectLoop(ctx context.Context, now bool) net.Conn {
 	fsm := h.fsm
 
 	retryInterval, addr, port, password, ttl, ttlMin, mss, localAddress, localPort, bindInterface, tos := func() (int, netip.Addr, int, string, uint8, uint8, uint16, string, int, string, uint8) {
@@ -1001,7 +1010,11 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 
 	tick := minConnectRetryInterval
 	for {
-		timer := time.NewTimer(time.Duration((0.75+rand.Float64()*0.25)*float64(tick)*1000) * time.Millisecond)
+		delay := time.Duration((0.75+rand.Float64()*0.25)*float64(tick)*1000) * time.Millisecond
+		if now {
+			delay, now = 0, false
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			fsm.logger.Debug("stop connect loop")
@@ -1065,7 +1078,7 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 	// below; a new manager would open another one to the peer.
 	if (fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil) && len(fsm.outgoingConnCh) == 0 {
 		fsm.logger.Info("starting outgoing connection manager")
-		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm)
+		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, true)
 	}
 
 	for {
@@ -1102,7 +1115,7 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 				result.conn.Close()
 				fsm.logger.Warn("failed to send keepalive on outgoing connection", slog.String("Error", err.Error()))
 				// the manager was stopped, restart it
-				fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm)
+				fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, false)
 			} else {
 				fsm.bgpMessageStateUpdate(bgp.BGP_MSG_KEEPALIVE, false)
 				fsm.lock.Lock()
