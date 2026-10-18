@@ -5913,3 +5913,33 @@ func TestUpdatePeerGroupSkipsDynamicNeighbor(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal([]string{static}, members)
 }
+
+// RFC 8950 section 4: IPv4 NLRI with an IPv6 next hop only to a peer that
+// advertised the Extended Next Hop Encoding capability for IPv4 unicast.
+func TestPostFilterpathExtendedNexthop(t *testing.T) {
+	s := NewBgpServer()
+	rib := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC}, oc.RouteSelectionOptionsConfig{}, oc.UseMultiplePathsConfig{})
+	peer := newPeerandInfo(t, 65000, 65001, "fe80::2", rib)
+	info := peer.peerInfo.Load()
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.17/32"))
+	require.NoError(t, err)
+	reach, err := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv4_UC, []bgp.PathNLRI{{NLRI: nlri}}, netip.MustParseAddr("fe80::1"))
+	require.NoError(t, err)
+	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	require.NoError(t, err)
+	v6 := table.NewPath(bgp.RF_IPv4_UC, info, bgp.PathNLRI{NLRI: nlri}, false, []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), reach}, time.Now(), false)
+	v4 := table.NewPath(bgp.RF_IPv4_UC, info, bgp.PathNLRI{NLRI: nlri}, false, []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), nh}, time.Now(), false)
+
+	if got := s.postFilterpath(peer, v6); got == nil || !got.IsWithdraw {
+		t.Fatalf("IPv6 next hop without the capability: got %v, want a withdrawal", got)
+	}
+	if got := s.postFilterpath(peer, v4); got == nil || got.IsWithdraw {
+		t.Fatalf("IPv4 next hop: got %v, want the path", got)
+	}
+	peer.fsm.capMap = map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface{
+		bgp.BGP_CAP_EXTENDED_NEXTHOP: {bgp.NewCapExtendedNexthop([]*bgp.CapExtendedNexthopTuple{bgp.NewCapExtendedNexthopTuple(bgp.RF_IPv4_UC, bgp.AFI_IP6)})},
+	}
+	if got := s.postFilterpath(peer, v6); got == nil || got.IsWithdraw {
+		t.Fatalf("IPv6 next hop with the capability: got %v, want the path", got)
+	}
+}
