@@ -15019,7 +15019,9 @@ func (msg *BGPUpdate) IsEndOfRib() (bool, RouteFamily) {
 			return true, RF_IPv4_UC
 		} else if len(msg.PathAttributes) == 1 && msg.PathAttributes[0].GetType() == BGP_ATTR_TYPE_MP_UNREACH_NLRI {
 			unreach := msg.PathAttributes[0].(*PathAttributeMpUnreachNLRI)
-			if len(unreach.Value) == 0 {
+			// Only AFI and SAFI: an attribute whose NLRIs of unknown
+			// EVPN route types were all discarded is not End-of-RIB.
+			if len(unreach.Value) == 0 && unreach.Length <= 3 {
 				return true, AfiSafiToRouteFamily(unreach.AFI, unreach.SAFI)
 			}
 		}

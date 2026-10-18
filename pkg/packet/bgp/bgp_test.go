@@ -3853,3 +3853,24 @@ func Test_MpReachNLRIDiscardsUnknownEVPNRouteType(t *testing.T) {
 		}
 	}
 }
+
+// An MP_UNREACH_NLRI with only NLRIs of unknown EVPN route types is empty
+// after the discard, but it is not End-of-RIB.
+func Test_DiscardedEVPNWithdrawIsNotEndOfRib(t *testing.T) {
+	unknown := append([]byte{6, 10}, make([]byte, 10)...)
+	value := append([]byte{0, 25, 70}, unknown...)
+	unreach := append([]byte{byte(BGP_ATTR_FLAG_OPTIONAL), byte(BGP_ATTR_TYPE_MP_UNREACH_NLRI), byte(len(value))}, value...)
+	body := append([]byte{0, 0, 0, byte(len(unreach))}, unreach...)
+	u := &BGPUpdate{}
+	require.NoError(t, u.DecodeFromBytes(body))
+	eor, _ := u.IsEndOfRib()
+	require.False(t, eor)
+
+	eorMsg, err := NewEndOfRib(RF_EVPN).Serialize()
+	require.NoError(t, err)
+	m, err := ParseBGPMessage(eorMsg)
+	require.NoError(t, err)
+	eor, family := m.Body.(*BGPUpdate).IsEndOfRib()
+	require.True(t, eor)
+	require.Equal(t, RF_EVPN, family)
+}
