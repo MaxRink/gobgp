@@ -127,7 +127,10 @@ type peer struct {
 	// map[table.PathLocalKey]struct{}
 	sendMaxPathFiltered sync.Map
 	llgrEndChs          []chan struct{} // protected by fsm.lock
-	longLivedRunning    atomic.Bool
+	// borrTimers bounds how long the routes that a BoRR marked stale stay
+	// without an EoRR (RFC 7313 Section 4), per family.
+	borrTimers       map[bgp.Family]*time.Timer // protected by fsm.lock
+	longLivedRunning atomic.Bool
 	// Route Target Membership handler after import policy (for constrained VPN distribution).
 	rtmHandler *table.RouteTargetMembershipHandler
 	// Route refresh in progress, during an established session or route refresh, this need to be atomic to avoid out of order updates
@@ -414,6 +417,29 @@ func (peer *peer) allNegotiatedEORReceived() bool {
 		}
 	}
 	return true
+}
+
+// eorReceived reports whether a graceful restart peer has sent End-of-RIB
+// for rf. It is true for a peer without graceful restart for rf.
+func (peer *peer) eorReceived(rf bgp.Family) bool {
+	for _, a := range peer.fsm.pConf.ReadOnly().AfiSafis {
+		if s := a.MpGracefulRestart.State; a.State.Family == rf && s.Enabled && s.Received && !s.EndOfRibReceived {
+			return false
+		}
+	}
+	return true
+}
+
+// stopBorrTimers stops the BoRR timers of families, or all of them.
+func (peer *peer) stopBorrTimers(families ...bgp.Family) {
+	peer.fsm.lock.Lock()
+	defer peer.fsm.lock.Unlock()
+	for rf, t := range peer.borrTimers {
+		if len(families) == 0 || slices.Contains(families, rf) {
+			t.Stop()
+			delete(peer.borrTimers, rf)
+		}
+	}
 }
 
 // receivedAllEOR reports whether the restarting speaker has received EOR from
