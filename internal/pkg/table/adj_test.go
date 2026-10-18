@@ -162,3 +162,20 @@ func TestLLGRStale(t *testing.T) {
 	assert.Equal(t, adj.Accepted([]bgp.RouteFamily{family}), 1)
 	assert.Equal(t, 2, len(adj.table[family].destinations))
 }
+
+func TestUpdateUnknownFamily(t *testing.T) {
+	// A path whose address family is not registered in adj.table must be
+	// silently skipped — not panic — in both Update and UpdateAdjRibOut.
+	// This covers the treat-as-withdraw path triggered by a malformed BGP
+	// UPDATE (RFC 7606): the peer may send NLRI for a family the local side
+	// never negotiated, causing a nil table lookup.
+	pi := &PeerInfo{}
+	attrs := []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0)}
+
+	nlri1 := bgp.NewIPAddrPrefix(24, "10.0.0.0")
+	p4 := NewPath(pi, nlri1, false, attrs, time.Now(), false)
+	// AdjRib only knows about IPv6; IPv4 path is unconfigured.
+	adj := NewAdjRib(logger, []bgp.RouteFamily{bgp.RF_IPv6_UC})
+	assert.NotPanics(t, func() { adj.Update([]*Path{p4}) })
+	assert.NotPanics(t, func() { adj.UpdateAdjRibOut([]*Path{p4}) })
+}

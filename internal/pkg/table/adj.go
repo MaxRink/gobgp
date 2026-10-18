@@ -46,7 +46,10 @@ func (adj *AdjRib) Update(pathList []*Path) {
 			continue
 		}
 		rf := path.GetRouteFamily()
-		t := adj.table[path.GetRouteFamily()]
+		t := adj.table[rf]
+		if t == nil {
+			continue
+		}
 		d := t.getOrCreateDest(path.GetNlri(), 0)
 		var old *Path
 		idx := -1
@@ -105,6 +108,9 @@ func (adj *AdjRib) UpdateAdjRibOut(pathList []*Path) {
 			continue
 		}
 		t := adj.table[path.GetRouteFamily()]
+		if t == nil {
+			continue
+		}
 		d := t.getOrCreateDest(path.GetNlri(), 0)
 		d.knownPathList = append(d.knownPathList, path)
 	}
