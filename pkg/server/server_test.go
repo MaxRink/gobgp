@@ -5420,6 +5420,48 @@ func TestResetPeerWhileAdminDownAppliesIdleHoldTimeAfterReset(t *testing.T) {
 	}
 }
 
+// A reset that arrives while an enabled peer already waits in Idle (the
+// fixed 5 s after an administrative shutdown and a new start, as when a
+// link comes back and BFD then goes down) shortens the running idle hold
+// timer to IdleHoldTimeAfterReset, capped at the fixed idle hold time. It
+// never makes it longer.
+func TestResetPeerShortensRunningIdleHoldTimer(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	for _, tt := range []struct {
+		name       string
+		afterReset float64
+		min, max   time.Duration
+	}{
+		{"after reset 1 s", 1, 500 * time.Millisecond, 3 * time.Second},
+		// 30 s is capped at 5 s: the reset does not make the wait longer
+		{"after reset 30 s", 30, 4 * time.Second, 7 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = tt.afterReset
+			})
+			ctx := context.Background()
+			establishSession(t, s, peer, asn, peerAddr)
+
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			require.NoError(t, s.DisablePeer(ctx, &api.DisablePeerRequest{Address: peerAddr}))
+			w.Wait(t, 10*time.Second)
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+			require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
+			time.Sleep(500 * time.Millisecond)
+			start := time.Now()
+			require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, BfdDown: true}))
+			w.Wait(t, 40*time.Second)
+			took := time.Since(start)
+			require.Less(t, took, tt.max)
+			require.Greater(t, took, tt.min)
+		})
+	}
+}
+
 // A hard ResetPeer against an established peer must still tear the session
 // down promptly. This is the behavior BFD relies on when it detects a failure
 // on a live session, and the drain that fixes the stale-notification bug must

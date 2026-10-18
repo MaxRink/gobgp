@@ -920,18 +920,29 @@ func (h *fsmHandler) failedConn(reason *fsmStateReason) (bgp.FSMState, *fsmState
 	}
 	if h.collided {
 		fsm.lock.Lock()
-		if t := fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset; t < fsm.idleHoldTime {
-			fsm.idleHoldTime = t
-		}
+		fsm.idleHoldTime = min(fsm.idleHoldTime, fsm.cappedIdleHoldTimeAfterReset())
 		fsm.lock.Unlock()
 	}
 	return bgp.BGP_FSM_IDLE, reason
+}
+
+// cappedIdleHoldTimeAfterReset is IdleHoldTimeAfterReset capped at the fixed
+// idle hold time (holdtimeIdle, 5 s). It is used where the FSM shortens a
+// wait that already runs or would run anyway (a collision that dropped both
+// connections, a reset while the idle hold timer runs): these never wait
+// longer than holdtimeIdle, although IdleHoldTimeAfterReset defaults to 30 s.
+// A reset of a session, or of a peer that is administratively down, still
+// waits the full IdleHoldTimeAfterReset.
+func (fsm *fsm) cappedIdleHoldTimeAfterReset() float64 {
+	return min(fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset, float64(holdtimeIdle))
 }
 
 func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
 
 	idleHoldTimer := time.NewTimer(time.Second * time.Duration(fsm.idleHoldTime))
+	// when the idle hold timer fires; zero while it is stopped
+	idleHoldDeadline := time.Now().Add(time.Second * time.Duration(fsm.idleHoldTime))
 
 	for {
 		select {
@@ -959,6 +970,16 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 			// is enabled.
 			if isResetNotification(notificationBody(m)) {
 				fsm.idleHoldTime = fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset
+				// A peer that is enabled already waits, for example the
+				// fixed idle hold time after an administrative shutdown
+				// and a new start: the reset shortens the running timer
+				// to the capped idle hold time after reset, counted from
+				// now, and never makes it longer.
+				d := time.Second * time.Duration(fsm.cappedIdleHoldTimeAfterReset())
+				if !idleHoldDeadline.IsZero() && time.Now().Add(d).Before(idleHoldDeadline) {
+					idleHoldTimer.Reset(d)
+					idleHoldDeadline = time.Now().Add(d)
+				}
 			}
 		case <-idleHoldTimer.C:
 			if fsm.adminState.Load() == adminStateUp {
@@ -976,10 +997,12 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 				case adminStateDown:
 					// stop idle hold timer
 					idleHoldTimer.Stop()
+					idleHoldDeadline = time.Time{}
 
 				case adminStateUp:
 					// restart idle hold timer
 					idleHoldTimer.Reset(time.Second * time.Duration(fsm.idleHoldTime))
+					idleHoldDeadline = time.Now().Add(time.Second * time.Duration(fsm.idleHoldTime))
 				}
 			}
 		}
