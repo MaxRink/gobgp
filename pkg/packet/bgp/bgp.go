@@ -3393,6 +3393,26 @@ type EVPNRouteTypeInterface interface {
 	MarshalJSON() ([]byte, error)
 }
 
+// unknownEVPNNLRILen returns the length of an EVPN NLRI at the start of
+// data when its route type is not supported. RFC 7606 section 5.4: a
+// speaker MUST discard routes with unrecognized NLRI types of a typed
+// address family such as EVPN, instead of treating the attribute as
+// malformed. A length past the end is left to the normal decoder, which
+// reports it.
+func unknownEVPNNLRILen(family Family, data []byte) (int, bool) {
+	if family != RF_EVPN || len(data) < 2 {
+		return 0, false
+	}
+	if _, err := getEVPNRouteType(data[0]); err == nil {
+		return 0, false
+	}
+	n := 2 + int(data[1])
+	if n > len(data) {
+		return 0, false
+	}
+	return n, true
+}
+
 func getEVPNRouteType(t uint8) (EVPNRouteTypeInterface, error) {
 	switch t {
 	case EVPN_ROUTE_TYPE_ETHERNET_AUTO_DISCOVERY:
@@ -13252,6 +13272,10 @@ func (p *PathAttributeMpReachNLRI) DecodeFromBytes(data []byte, options ...*Mars
 			id = binary.BigEndian.Uint32(value[:addpathLen])
 			value = value[addpathLen:]
 		}
+		if n, ok := unknownEVPNNLRILen(family, value); ok {
+			value = value[n:]
+			continue
+		}
 		prefix, err := NLRIFromSlice(family, value, options...)
 		if err != nil {
 			return NewMessageError(eCode, BGP_ERROR_SUB_INVALID_NETWORK_FIELD, eData, err.Error())
@@ -13464,6 +13488,10 @@ func (p *PathAttributeMpUnreachNLRI) DecodeFromBytes(data []byte, options ...*Ma
 			}
 			id = binary.BigEndian.Uint32(value[:4])
 			value = value[4:]
+		}
+		if n, ok := unknownEVPNNLRILen(family, value); ok {
+			value = value[n:]
+			continue
 		}
 
 		prefix, err := NLRIFromSlice(family, value, options...)
@@ -17192,7 +17220,9 @@ func (msg *BGPUpdate) IsEndOfRib() (bool, Family) {
 			return true, RF_IPv4_UC
 		} else if len(msg.PathAttributes) == 1 && msg.PathAttributes[0].GetType() == BGP_ATTR_TYPE_MP_UNREACH_NLRI {
 			unreach := msg.PathAttributes[0].(*PathAttributeMpUnreachNLRI)
-			if len(unreach.Value) == 0 {
+			// Only AFI and SAFI: an attribute whose NLRIs of unknown
+			// EVPN route types were all discarded is not End-of-RIB.
+			if len(unreach.Value) == 0 && unreach.Length <= 3 {
 				return true, NewFamily(unreach.AFI, unreach.SAFI)
 			}
 		}
