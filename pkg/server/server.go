@@ -4531,6 +4531,9 @@ func (s *BgpServer) ResetPeer(ctx context.Context, r *api.ResetPeerRequest) erro
 			return err
 		}
 
+		if r.BfdDown {
+			return s.sendNotification("Neighbor reset, BFD down", addr, bgp.BGP_ERROR_SUB_BFD_DOWN, nil)
+		}
 		return s.sendNotification("Neighbor reset", addr, bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET, newAdministrativeCommunication(comm))
 	}, true)
 }

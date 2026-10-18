@@ -7747,3 +7747,13 @@ func TestEVPNIPMSISerializeLayout(t *testing.T) {
 		}
 	}
 }
+
+// Cease/BFD Down (RFC 9384) has a name and goes out as Hard Reset when the
+// N bit is exchanged (RFC 9384 Section 5), like FRR.
+func TestCeaseBFDDown(t *testing.T) {
+	require.Equal(t, uint8(10), uint8(BGP_ERROR_SUB_BFD_DOWN))
+	require.Equal(t, "code 6(cease) subcode 10(bfd down)", NewNotificationErrorCode(BGP_ERROR_CEASE, BGP_ERROR_SUB_BFD_DOWN).String())
+	require.Equal(t, "code 6(cease) subcode 9(hard reset)", NewNotificationErrorCode(BGP_ERROR_CEASE, BGP_ERROR_SUB_HARD_RESET).String())
+	require.True(t, ShouldHardReset(BGP_ERROR_SUB_BFD_DOWN, false))
+	require.False(t, ShouldHardReset(BGP_ERROR_SUB_ADMINISTRATIVE_RESET, false))
+}
