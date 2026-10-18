@@ -6156,7 +6156,7 @@ func TestDeletePeerDropsPolicyAssignment(t *testing.T) {
 // startServerWithPassivePeer starts a BgpServer without a TCP listener and
 // adds one passive ipv4-unicast neighbor, so tests can drive sessions by
 // injecting MockConnections into the peer's FSM.
-func startServerWithPassivePeer(t *testing.T, asn uint32, peerAddr string) (*BgpServer, *peer) {
+func startServerWithPassivePeer(t *testing.T, asn uint32, peerAddr string, opts ...func(*oc.Neighbor)) (*BgpServer, *peer) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -6194,6 +6194,10 @@ func startServerWithPassivePeer(t *testing.T, asn uint32, peerAddr string) (*Bgp
 				},
 			},
 		},
+	}
+
+	for _, o := range opts {
+		o(neighbor)
 	}
 
 	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
@@ -6477,6 +6481,129 @@ func TestListPolicyOriginCondition(t *testing.T) {
 		require.Len(t, listed, 1)
 		assert.Equal(t, origin, listed[0].Conditions.Origin, "ListStatement, statement %s", name)
 	}
+}
+
+// pushOpen sends the peer's OPEN with caps and a KEEPALIVE on m.
+func pushOpen(t *testing.T, m *MockConnection, asn uint32, peerAddr string, caps ...bgp.ParameterCapabilityInterface) {
+	t.Helper()
+	openMsg, err := bgp.NewBGPOpenMessage(uint16(asn), 90, netip.MustParseAddr(peerAddr),
+		[]bgp.OptionParameterInterface{bgp.NewOptionParameterCapability(caps)})
+	require.NoError(t, err)
+	go func() {
+		m.PushBgpMessage(openMsg)
+		m.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
+	}()
+}
+
+// RFC 4724 section 4.2: a new connection from a peer that negotiated
+// graceful restart, while its session is still Established, means that
+// the peer restarted. The speaker ends the old session, keeps the peer's
+// routes as stale, takes the new connection and removes the stale routes
+// at End-of-RIB. Before, it closed the new connection and kept the old
+// session until its hold timer expired.
+func TestNewConnectionFromRestartingPeer(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.GracefulRestart.Config.Enabled = true
+		n.GracefulRestart.Config.HelperOnly = true
+		n.GracefulRestart.Config.RestartTime = 120
+		n.AfiSafis[0].MpGracefulRestart.Config.Enabled = true
+	})
+	grCaps := func(restarting bool) []bgp.ParameterCapabilityInterface {
+		return []bgp.ParameterCapabilityInterface{
+			bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC),
+			bgp.NewCapGracefulRestart(restarting, false, 120, []*bgp.CapGracefulRestartTuple{bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, true)}),
+		}
+	}
+	adjIn := func() []string {
+		var out []string
+		_ = s.ListPath(apiutil.ListPathRequest{TableType: api.TableType_TABLE_TYPE_ADJ_IN, Name: peerAddr, Family: bgp.RF_IPv4_UC},
+			func(prefix bgp.NLRI, _ []*apiutil.Path) { out = append(out, prefix.String()) })
+		return out
+	}
+
+	m1 := NewMockConnection()
+	m1.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m1.Close() })
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+	peer.fsm.connCh <- m1
+	pushOpen(t, m1, asn, peerAddr, grCaps(false)...)
+	w.Wait(t, 10*time.Second)
+	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr(peerAddr))
+	require.NoError(t, err)
+	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("198.51.100.0/24"))
+	require.NoError(t, err)
+	m1.PushBgpMessage(bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0), bgp.NewPathAttributeAsPath(nil), nh, bgp.NewPathAttributeLocalPref(100),
+	}, []bgp.PathNLRI{{NLRI: nlri}}))
+	require.Eventually(t, func() bool { return len(adjIn()) == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	// The peer restarts and connects again before its old session ends.
+	m2 := NewMockConnection()
+	m2.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m2.Close() })
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+	peer.PassConn(m2)
+	pushOpen(t, m2, asn, peerAddr, grCaps(true)...)
+	require.Eventually(t, func() bool {
+		for _, b := range m2.GetSentMessages() {
+			if msg, err := bgp.ParseBGPMessage(b); err == nil && msg.Header.Type == bgp.BGP_MSG_KEEPALIVE {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond, "no session on the new connection")
+	w.Wait(t, 10*time.Second)
+	require.Equal(t, []string{"198.51.100.0/24"}, adjIn(), "the routes stay as stale until End-of-RIB")
+
+	m2.PushBgpMessage(bgp.NewEndOfRib(bgp.RF_IPv4_UC))
+	require.Eventually(t, func() bool { return len(adjIn()) == 0 }, 5*time.Second, 10*time.Millisecond,
+		"stale routes not removed at End-of-RIB: %v", adjIn())
+}
+
+// A peer that sends the graceful restart capability without AFI/SAFI
+// tuples (a helper-only peer, for example FRR without "bgp graceful-restart")
+// does not preserve its forwarding state. A new connection from it while
+// the session is Established is a connection collision (RFC 4271 Section
+// 6.8): the new connection is closed and the session stays up. RFC 4724
+// Section 5 handles it as a restart only for a peer that sent tuples, and
+// FRR does the same (bgp_accept acts only with PEER_STATUS_NSF_MODE, which
+// is set only for a family with PEER_CAP_RESTART_AF_RCV).
+func TestNewConnectionFromHelperOnlyPeerIsCollision(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.GracefulRestart.Config.Enabled = true
+		n.GracefulRestart.Config.HelperOnly = true
+		n.GracefulRestart.Config.RestartTime = 120
+		n.AfiSafis[0].MpGracefulRestart.Config.Enabled = true
+	})
+	helperOnly := []bgp.ParameterCapabilityInterface{
+		bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC),
+		bgp.NewCapGracefulRestart(false, false, 120, nil),
+	}
+
+	m1 := NewMockConnection()
+	m1.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m1.Close() })
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+	peer.fsm.connCh <- m1
+	pushOpen(t, m1, asn, peerAddr, helperOnly...)
+	w.Wait(t, 10*time.Second)
+
+	m2 := NewMockConnection()
+	m2.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m2.Close() })
+	peer.PassConn(m2)
+	require.Never(t, func() bool {
+		return peer.State() != bgp.BGP_FSM_ESTABLISHED
+	}, 2*time.Second, 10*time.Millisecond, "the session ended for a new connection of a helper-only peer")
+	require.Empty(t, m2.GetSentMessages(), "the new connection is closed without a message")
 }
 
 // global.afi-safis no longer selects the Loc-RIB tables. A family left out of

@@ -1011,6 +1011,25 @@ type fsmHandler struct {
 	callback      fsmCallback
 }
 
+// peerSentGracefulRestartTuples reports whether the peer sent at least one
+// AFI/SAFI tuple in the graceful restart capability of the current
+// session. RFC 4724 Section 5 (Events 16 and 17) treats a new connection
+// while Established as a restart only for such a peer; FRR likewise
+// (bgp_accept acts only with PEER_STATUS_NSF_MODE, which bgp_establish
+// computes for each session from PEER_CAP_RESTART_AF_RCV). The per-family
+// MpGracefulRestart.State.Received is not used: it is never cleared, so it
+// still holds the tuples of an earlier session.
+func (fsm *fsm) peerSentGracefulRestartTuples() bool {
+	fsm.lock.Lock()
+	defer fsm.lock.Unlock()
+	gr := fsm.capMap[bgp.BGP_CAP_GRACEFUL_RESTART]
+	if len(gr) == 0 {
+		return false
+	}
+	c, ok := gr[len(gr)-1].(*bgp.CapGracefulRestart)
+	return ok && len(c.Tuples) > 0
+}
+
 // nextIdleHoldTime returns the idle hold time of the Idle state that the
 // session enters for reason, and the new backoff value. backoff is the
 // current backoff value, and afterReset is idle-hold-time-after-reset.
@@ -2382,6 +2401,27 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 		case conn, ok := <-fsm.connCh:
 			if !ok {
 				break
+			}
+			conf := fsm.pConf.ReadOnly()
+			if conf.GracefulRestart.State.Enabled && fsm.peerSentGracefulRestartTuples() {
+				// RFC 4724 Section 4.2: a new connection from a peer
+				// that negotiated graceful restart means that the peer
+				// restarted. Close the old session as if its TCP
+				// connection had failed, keep the peer's routes as
+				// stale, and take the new connection in Active. Only
+				// for a peer that sent AFI/SAFI tuples: a helper-only
+				// peer preserves no forwarding state, and its new
+				// connection is a collision (RFC 4271 Section 6.8).
+				fsm.conn.Close()
+				h.outgoing.In() <- *newfsmStateReason(fsmGracefulRestart, nil, nil)
+				fsm.logger.Info("peer graceful restart: new connection while established", slog.String("State", fsm.state.String()))
+				fsm.lock.Lock()
+				fsm.gracefulRestartTimer.Reset(time.Duration(conf.GracefulRestart.State.PeerRestartTime) * time.Second)
+				fsm.lock.Unlock()
+				if !nonblockSendChannel(fsm.connCh, conn) {
+					conn.Close()
+				}
+				return bgp.BGP_FSM_ACTIVE, newfsmStateReason(fsmGracefulRestart, nil, nil)
 			}
 			conn.Close()
 			fsm.logger.Warn("Closed an accepted connection", slog.String("State", fsm.state.String()))
