@@ -1081,7 +1081,7 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 	// below; a new manager would open another one to the peer.
 	if (fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil) && len(fsm.outgoingConnCh) == 0 {
 		fsm.logger.Info("starting outgoing connection manager")
-		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, true)
+		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, fsm.pConf.ReadOnly().Timers.Config.ConnectAtOnce)
 	}
 
 	for {
