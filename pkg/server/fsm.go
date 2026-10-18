@@ -196,6 +196,9 @@ type fsmMsg struct {
 
 type fsmOutgoingMsg struct {
 	Paths []*table.Path
+	// Message is sent as it is, after the UPDATEs of the messages queued
+	// before it, for example a ROUTE-REFRESH with BoRR or EoRR.
+	Message *bgp.BGPMessage
 }
 
 const (
@@ -1341,6 +1344,7 @@ func capabilitiesFromConfig(pConf *oc.Neighbor) []bgp.ParameterCapabilityInterfa
 	fqdn, _ := os.Hostname()
 	caps := make([]bgp.ParameterCapabilityInterface, 0, 4)
 	caps = append(caps, bgp.NewCapRouteRefresh())
+	caps = append(caps, bgp.NewCapEnhancedRouteRefresh())
 	caps = append(caps, bgp.NewCapFQDN(fqdn, ""))
 
 	if pConf.Config.SendSoftwareVersion || pConf.Config.PeerType == oc.PEER_TYPE_INTERNAL {
@@ -2079,6 +2083,12 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateRe
 				slog.Any("attributes", update.PathAttributes))
 		case bgp.BGP_MSG_KEEPALIVE:
 			// nothing to do
+		case bgp.BGP_MSG_ROUTE_REFRESH:
+			rr := m.Body.(*bgp.BGPRouteRefresh)
+			fsm.logger.Debug("sent route refresh",
+				slog.String("State", fsm.state.String()),
+				slog.String("Family", bgp.NewFamily(rr.AFI, rr.SAFI).String()),
+				slog.Int("Subtype", int(rr.Demarcation)))
 		default:
 			fsm.logger.Error("unexpected message sent",
 				slog.String("State", fsm.state.String()),
@@ -2095,10 +2105,19 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateRe
 		case o := <-h.outgoing.Out():
 			switch m := o.(type) {
 			case *fsmOutgoingMsg:
+				if m.Message != nil {
+					if err := send(m.Message); err != nil {
+						return nil
+					}
+					continue
+				}
 				const maxCoalesceMsgs = 2048 // safety cap
 				paths := m.Paths
 				coalescedMsgs := 1
+				// a message to send after the coalesced UPDATEs
+				var next *bgp.BGPMessage
 				// coalesce queued messages for more efficient UPDATE packing
+			coalesce:
 				for coalescedMsgs < maxCoalesceMsgs {
 					select {
 					case <-ctx.Done():
@@ -2108,6 +2127,10 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateRe
 					select {
 					case o2 := <-h.outgoing.Out():
 						if m2, ok := o2.(*fsmOutgoingMsg); ok {
+							if m2.Message != nil {
+								next = m2.Message
+								break coalesce
+							}
 							paths = append(paths, m2.Paths...)
 							coalescedMsgs++
 							continue
@@ -2129,6 +2152,11 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateRe
 				}
 				for _, msg := range table.CreateUpdateMsgFromPaths(paths, options) {
 					if err := send(msg); err != nil {
+						return nil
+					}
+				}
+				if next != nil {
+					if err := send(next); err != nil {
 						return nil
 					}
 				}
