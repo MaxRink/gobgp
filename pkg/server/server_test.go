@@ -2391,3 +2391,31 @@ func TestAddDefinedSetReplace(t *testing.T) {
 	assert.Equal("replaceme", ns[0].Name)
 	assert.Equal([]string{"203.0.113.2/32"}, ns[0].List)
 }
+
+// RFC 8950 section 4: IPv4 NLRI with an IPv6 next hop only to a peer that
+// advertised the Extended Next Hop Encoding capability for IPv4 unicast.
+func TestPostFilterpathExtendedNexthop(t *testing.T) {
+	s := NewBgpServer()
+	rib := table.NewTableManager(logger, []bgp.RouteFamily{bgp.RF_IPv4_UC})
+	peer, info := newPeerandInfo(65000, 65001, "fe80::2", rib)
+	nlri := bgp.NewIPAddrPrefix(32, "192.0.2.17")
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeMpReachNLRI("fe80::1", []bgp.AddrPrefixInterface{nlri}),
+	}
+	v6 := table.NewPath(info, nlri, false, attrs, time.Now(), false)
+	v4 := table.NewPath(info, nlri, false, []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), bgp.NewPathAttributeNextHop("192.0.2.1")}, time.Now(), false)
+
+	if got := s.postFilterpath(peer, v6); got == nil || !got.IsWithdraw {
+		t.Fatalf("IPv6 next hop without the capability: got %v, want a withdrawal", got)
+	}
+	if got := s.postFilterpath(peer, v4); got == nil || got.IsWithdraw {
+		t.Fatalf("IPv4 next hop: got %v, want the path", got)
+	}
+	peer.fsm.capMap[bgp.BGP_CAP_EXTENDED_NEXTHOP] = []bgp.ParameterCapabilityInterface{
+		bgp.NewCapExtendedNexthop([]*bgp.CapExtendedNexthopTuple{bgp.NewCapExtendedNexthopTuple(bgp.RF_IPv4_UC, bgp.AFI_IP6)}),
+	}
+	if got := s.postFilterpath(peer, v6); got == nil || got.IsWithdraw {
+		t.Fatalf("IPv6 next hop with the capability: got %v, want the path", got)
+	}
+}
