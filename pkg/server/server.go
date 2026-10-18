@@ -494,6 +494,13 @@ func sendfsmOutgoingMsg(peer *peer, paths []*table.Path) {
 	}
 }
 
+// sendfsmOutgoingMsgRaw queues m after the paths queued before.
+func sendfsmOutgoingMsgRaw(peer *peer, m *bgp.BGPMessage) {
+	peer.fsm.outgoingCh.In() <- &fsmOutgoingMsg{
+		Message: m,
+	}
+}
+
 func isASLoop(peer *peer, path *table.Path) bool {
 	return slices.Contains(path.GetAsList(), peer.AS())
 }
@@ -1263,18 +1270,44 @@ func (s *BgpServer) handleRouteRefresh(peer *peer, e *fsmMsg) {
 
 	peer.fsm.lock.Lock()
 	_, ok := peer.fsm.capMap[bgp.BGP_CAP_ROUTE_REFRESH]
+	_, enhanced := peer.fsm.capMap[bgp.BGP_CAP_ENHANCED_ROUTE_REFRESH]
 	peer.fsm.lock.Unlock()
 	if !ok {
 		peer.fsm.logger.Warn("ROUTE_REFRESH received but the capability wasn't advertised")
 		return
 	}
 	rfList := []bgp.Family{rf}
+	// RFC 7313: with Enhanced Route Refresh the peer brackets its
+	// re-advertisement with BoRR and EoRR. The routes of the family that
+	// the peer does not send again by EoRR are gone.
+	switch rr.Demarcation {
+	case bgp.BGP_ROUTE_REFRESH_NORMAL:
+	case bgp.BGP_ROUTE_REFRESH_BORR:
+		if enhanced {
+			peer.adjRibIn.StaleAll(rfList)
+		}
+		return
+	case bgp.BGP_ROUTE_REFRESH_EORR:
+		if enhanced {
+			s.propagateUpdate(peer, peer.adjRibIn.DropStale(rfList))
+		}
+		return
+	default:
+		// RFC 7313 Section 5: ignore other subtypes.
+		return
+	}
+	if enhanced {
+		sendfsmOutgoingMsgRaw(peer, bgp.NewBGPRouteRefreshMessage(rf.Afi(), bgp.BGP_ROUTE_REFRESH_BORR, rf.Safi()))
+	}
 	s.getBestFromLocalCallback(peer, rfList, true, true, func(paths []*table.Path, filtered []*table.Path) {
 		if len(paths) > 0 {
 			peer.updateRoutes(paths...)
 			sendfsmOutgoingMsg(peer, paths)
 		}
 	})
+	if enhanced {
+		sendfsmOutgoingMsgRaw(peer, bgp.NewBGPRouteRefreshMessage(rf.Afi(), bgp.BGP_ROUTE_REFRESH_EORR, rf.Safi()))
+	}
 }
 
 // dropAdjRIBIn removes the peer's Adj-RIB-In for the given families and
