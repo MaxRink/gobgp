@@ -2110,6 +2110,13 @@ func NewExtendedCommunitiesAttributeFromNative(a *bgp.PathAttributeExtendedCommu
 				ControlFlags: uint32(v.ControlFlags),
 				Mtu:          uint32(v.MTU),
 			}
+		case *bgp.ArpNdExtended:
+			community = &api.ArpNdExtended{
+				IsRouter:    v.IsRouter,
+				IsOverride:  v.IsOverride,
+				IsProxy:     v.IsProxy,
+				IsImmutable: v.IsImmutable,
+			}
 		case *bgp.UnknownExtended:
 			community = &api.UnknownExtended{
 				Type:  uint32(v.Type),
@@ -2177,6 +2184,8 @@ func unmarshalExComm(a *api.ExtendedCommunitiesAttribute) (*bgp.PathAttributeExt
 			community = bgp.NewMUPExtended(uint16(v.SegmentId2), v.SegmentId4)
 		case *api.VPLSExtended:
 			community = bgp.NewVPLSExtended(uint8(v.ControlFlags), uint16(v.Mtu))
+		case *api.ArpNdExtended:
+			community = bgp.NewArpNdExtended(v.IsRouter, v.IsOverride, v.IsProxy, v.IsImmutable)
 		case *api.UnknownExtended:
 			community = bgp.NewUnknownExtended(bgp.ExtendedCommunityAttrType(v.Type), v.Value)
 		}
