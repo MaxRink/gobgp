@@ -30,6 +30,7 @@ import (
 	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type MockConnection struct {
@@ -411,4 +412,23 @@ func openWithBadBGPIdentifier_Same() *bgp.BGPMessage {
 
 func keepalive() *bgp.BGPMessage {
 	return bgp.NewBGPKeepAliveMessage()
+}
+
+// The Extended Nexthop capability lists only the IPv4 families of RFC 8950
+// Section 3, not L2VPN EVPN or the IPv6 families.
+func TestCapabilitiesExtendedNexthopIPv4Only(t *testing.T) {
+	var afs []oc.AfiSafi
+	for _, f := range []bgp.RouteFamily{bgp.RF_IPv4_UC, bgp.RF_IPv6_UC, bgp.RF_EVPN, bgp.RF_IPv4_VPN, bgp.RF_IPv6_VPN, bgp.RF_IPv4_MPLS, bgp.RF_FS_IPv4_UC} {
+		afs = append(afs, oc.AfiSafi{State: oc.AfiSafiState{Family: f}})
+	}
+	var got []bgp.RouteFamily
+	for _, c := range capabilitiesFromConfig(&oc.Neighbor{AfiSafis: afs}) {
+		if e, ok := c.(*bgp.CapExtendedNexthop); ok {
+			for _, tu := range e.Tuples {
+				require.Equal(t, uint16(bgp.AFI_IP6), tu.NexthopAFI)
+				got = append(got, bgp.AfiSafiToRouteFamily(tu.NLRIAFI, uint8(tu.NLRISAFI)))
+			}
+		}
+	}
+	require.Equal(t, []bgp.RouteFamily{bgp.RF_IPv4_UC, bgp.RF_IPv4_VPN, bgp.RF_IPv4_MPLS}, got)
 }
