@@ -71,3 +71,10 @@ code contributing.
 GoBGP is licensed under the Apache License, Version 2.0. See
 [LICENSE](https://github.com/osrg/gobgp/blob/master/LICENSE) for the full
 license text.
+
+## Fork branch booty/v4.10
+
+This branch is GoBGP v4.10.0 with the fixes and features that BOOTy needs,
+released as the tags `v4.10.0-booty.N`. Do not use `v4.10.0-booty.7`: it
+stops answering a NOTIFICATION in OpenSent, which RFC 4271 Section 8.2.2
+does not allow. `v4.10.0-booty.8` and later answer it again.
