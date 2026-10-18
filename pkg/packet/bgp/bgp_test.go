@@ -7747,3 +7747,60 @@ func TestEVPNIPMSISerializeLayout(t *testing.T) {
 		}
 	}
 }
+
+// RFC 7606 section 5.4: EVPN NLRIs of an unknown route type are discarded;
+// the known NLRIs of the same attribute stay and no error is raised.
+func Test_MpReachNLRIDiscardsUnknownEVPNRouteType(t *testing.T) {
+	assert := assert.New(t)
+	rd, _ := ParseRouteDistinguisher("65000:100")
+	r3, err := NewEVPNMulticastEthernetTagRoute(rd, 0, netip.MustParseAddr("192.0.2.1"))
+	assert.NoError(err)
+	known, err := r3.Serialize()
+	assert.NoError(err)
+	unknown := append([]byte{6, 10}, make([]byte, 10)...) // SMET (RFC 9251)
+	attr := func(typ BGPAttrType, value []byte) []byte {
+		b := []byte{byte(BGP_ATTR_FLAG_OPTIONAL | BGP_ATTR_FLAG_EXTENDED_LENGTH), byte(typ), 0, 0}
+		binary.BigEndian.PutUint16(b[2:], uint16(len(value)))
+		return append(b, value...)
+	}
+	nlris := append(append(append([]byte{}, unknown...), known...), unknown...)
+	reach := attr(BGP_ATTR_TYPE_MP_REACH_NLRI, append([]byte{0, 25, 70, 4, 192, 0, 2, 1, 0}, nlris...))
+	unreach := attr(BGP_ATTR_TYPE_MP_UNREACH_NLRI, append([]byte{0, 25, 70}, nlris...))
+
+	r := &PathAttributeMpReachNLRI{}
+	assert.NoError(r.DecodeFromBytes(reach))
+	u := &PathAttributeMpUnreachNLRI{}
+	assert.NoError(u.DecodeFromBytes(unreach))
+	for _, got := range [][]PathNLRI{r.Value, u.Value} {
+		if assert.Len(got, 1) {
+			b, err := got[0].NLRI.Serialize()
+			assert.NoError(err)
+			assert.Equal(known, b)
+		}
+	}
+
+	// A length past the end is still an error.
+	short := attr(BGP_ATTR_TYPE_MP_UNREACH_NLRI, []byte{0, 25, 70, 6, 10, 0})
+	assert.Error((&PathAttributeMpUnreachNLRI{}).DecodeFromBytes(short))
+}
+
+// An MP_UNREACH_NLRI with only NLRIs of unknown EVPN route types is empty
+// after the discard, but it is not End-of-RIB.
+func Test_DiscardedEVPNWithdrawIsNotEndOfRib(t *testing.T) {
+	unknown := append([]byte{6, 10}, make([]byte, 10)...)
+	value := append([]byte{0, 25, 70}, unknown...)
+	unreach := append([]byte{byte(BGP_ATTR_FLAG_OPTIONAL), byte(BGP_ATTR_TYPE_MP_UNREACH_NLRI), byte(len(value))}, value...)
+	body := append([]byte{0, 0, 0, byte(len(unreach))}, unreach...)
+	u := &BGPUpdate{}
+	require.NoError(t, u.DecodeFromBytes(body))
+	eor, _ := u.IsEndOfRib()
+	require.False(t, eor)
+
+	eorMsg, err := NewEndOfRib(RF_EVPN).Serialize()
+	require.NoError(t, err)
+	m, err := ParseBGPMessage(eorMsg)
+	require.NoError(t, err)
+	eor, family := m.Body.(*BGPUpdate).IsEndOfRib()
+	require.True(t, eor)
+	require.Equal(t, RF_EVPN, family)
+}
