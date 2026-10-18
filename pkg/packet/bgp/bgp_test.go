@@ -3822,3 +3822,34 @@ func FuzzParseFlowSpecComponents(f *testing.F) {
 		ParseFlowSpecComponents(RF_FS_IPv4_UC, data)
 	})
 }
+
+// RFC 7606 section 5.4: EVPN NLRIs of an unknown route type are discarded;
+// the known NLRIs of the same attribute stay and no error is raised.
+func Test_MpReachNLRIDiscardsUnknownEVPNRouteType(t *testing.T) {
+	assert := assert.New(t)
+	rd, _ := ParseRouteDistinguisher("65000:100")
+	r3 := NewEVPNMulticastEthernetTagRoute(rd, 0, "192.0.2.1")
+	known, err := r3.Serialize()
+	assert.NoError(err)
+	unknown := append([]byte{6, 10}, make([]byte, 10)...) // SMET (RFC 9251)
+	attr := func(typ BGPAttrType, value []byte) []byte {
+		b := []byte{byte(BGP_ATTR_FLAG_OPTIONAL | BGP_ATTR_FLAG_EXTENDED_LENGTH), byte(typ), 0, 0}
+		binary.BigEndian.PutUint16(b[2:], uint16(len(value)))
+		return append(b, value...)
+	}
+	nlris := append(append(append([]byte{}, unknown...), known...), unknown...)
+	reach := attr(BGP_ATTR_TYPE_MP_REACH_NLRI, append([]byte{0, 25, 70, 4, 192, 0, 2, 1, 0}, nlris...))
+	unreach := attr(BGP_ATTR_TYPE_MP_UNREACH_NLRI, append([]byte{0, 25, 70}, nlris...))
+
+	r := &PathAttributeMpReachNLRI{}
+	assert.NoError(r.DecodeFromBytes(reach))
+	u := &PathAttributeMpUnreachNLRI{}
+	assert.NoError(u.DecodeFromBytes(unreach))
+	for _, got := range [][]AddrPrefixInterface{r.Value, u.Value} {
+		if assert.Len(got, 1) {
+			b, err := got[0].Serialize()
+			assert.NoError(err)
+			assert.Equal(known, b)
+		}
+	}
+}
