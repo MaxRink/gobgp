@@ -1063,7 +1063,7 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 
 	if fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil {
 		fsm.logger.Info("starting outgoing connection manager")
-		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, true)
+		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, fsm.pConf.ReadOnly().Timers.Config.ConnectAtOnce)
 	}
 
 	for {
