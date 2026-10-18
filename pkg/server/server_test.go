@@ -5391,23 +5391,33 @@ func TestResetPeerWhileAdminDownAppliesIdleHoldTimeAfterReset(t *testing.T) {
 		peerAddr = "10.0.0.1"
 	)
 
-	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
-		n.Timers.Config.IdleHoldTimeAfterReset = 1
-	})
-	ctx := context.Background()
-	establishSession(t, s, peer, asn, peerAddr)
+	for _, tt := range []struct {
+		name string
+		req  *api.ResetPeerRequest
+	}{
+		{"administrative reset", &api.ResetPeerRequest{Address: peerAddr, Communication: "BFD is down"}},
+		{"bfd down", &api.ResetPeerRequest{Address: peerAddr, BfdDown: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = 1
+			})
+			ctx := context.Background()
+			establishSession(t, s, peer, asn, peerAddr)
 
-	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
-	require.NoError(t, s.DisablePeer(ctx, &api.DisablePeerRequest{Address: peerAddr}))
-	w.Wait(t, 10*time.Second)
-	require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, Communication: "BFD is down"}))
-	require.Eventually(t, func() bool { return len(peer.fsm.notification) == 0 }, 5*time.Second, 10*time.Millisecond)
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			require.NoError(t, s.DisablePeer(ctx, &api.DisablePeerRequest{Address: peerAddr}))
+			w.Wait(t, 10*time.Second)
+			require.NoError(t, s.ResetPeer(ctx, tt.req))
+			require.Eventually(t, func() bool { return len(peer.fsm.notification) == 0 }, 5*time.Second, 10*time.Millisecond)
 
-	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
-	start := time.Now()
-	require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
-	w.Wait(t, 10*time.Second)
-	require.Less(t, time.Since(start), 3*time.Second, "idle hold time after reset (1 s) not applied")
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+			start := time.Now()
+			require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
+			w.Wait(t, 10*time.Second)
+			require.Less(t, time.Since(start), 3*time.Second, "idle hold time after reset (1 s) not applied")
+		})
+	}
 }
 
 // A hard ResetPeer against an established peer must still tear the session

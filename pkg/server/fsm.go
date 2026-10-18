@@ -833,6 +833,13 @@ func (fsm *fsm) stateChange(nextState bgp.FSMState, reason *fsmStateReason) {
 	}
 }
 
+// isResetNotification reports whether b is a reset from ResetPeer: Cease
+// with Administrative Reset or BFD Down. Both apply IdleHoldTimeAfterReset.
+func isResetNotification(b *bgp.BGPNotification) bool {
+	return b != nil && b.ErrorCode == bgp.BGP_ERROR_CEASE &&
+		(b.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET || b.ErrorSubcode == bgp.BGP_ERROR_SUB_BFD_DOWN)
+}
+
 func (fsm *fsm) sendNotification(conn net.Conn, msg *bgp.BGPMessage) error {
 	body := msg.Body.(*bgp.BGPNotification)
 	if body.ErrorCode == bgp.BGP_ERROR_CEASE && (body.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_SHUTDOWN || body.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET) {
@@ -924,7 +931,7 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 			// after reset, as it does after a reset of a session (as in
 			// v3). An administratively down peer starts with it when it
 			// is enabled.
-			if b := notificationBody(m); b != nil && b.ErrorCode == bgp.BGP_ERROR_CEASE && b.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET {
+			if isResetNotification(notificationBody(m)) {
 				fsm.idleHoldTime = fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset
 			}
 		case <-idleHoldTimer.C:
