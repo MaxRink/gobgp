@@ -3404,6 +3404,26 @@ type EVPNRouteTypeInterface interface {
 	MarshalJSON() ([]byte, error)
 }
 
+// unknownEVPNNLRILen returns the length of an EVPN NLRI (with its path
+// identifier) at the start of data when its route type is not supported.
+// RFC 7606 section 5.4: a speaker MUST discard routes with unrecognized
+// NLRI types of a typed address family such as EVPN, instead of treating
+// the attribute as malformed. A length past the end is left to the normal
+// decoder, which reports it.
+func unknownEVPNNLRILen(afi uint16, safi uint8, data []byte, addpathLen int) (int, bool) {
+	if afi != AFI_L2VPN || safi != SAFI_EVPN || len(data) < addpathLen+2 {
+		return 0, false
+	}
+	if _, err := getEVPNRouteType(data[addpathLen]); err == nil {
+		return 0, false
+	}
+	n := addpathLen + 2 + int(data[addpathLen+1])
+	if n > len(data) {
+		return 0, false
+	}
+	return n, true
+}
+
 func getEVPNRouteType(t uint8) (EVPNRouteTypeInterface, error) {
 	switch t {
 	case EVPN_ROUTE_TYPE_ETHERNET_AUTO_DISCOVERY:
@@ -11627,6 +11647,10 @@ func (p *PathAttributeMpReachNLRI) DecodeFromBytes(data []byte, options ...*Mars
 		addpathLen = 4
 	}
 	for len(value) > 0 {
+		if n, ok := unknownEVPNNLRILen(afi, safi, value, addpathLen); ok {
+			value = value[n:]
+			continue
+		}
 		prefix, err := NewPrefixFromRouteFamily(afi, safi)
 		if err != nil {
 			return NewMessageError(eCode, BGP_ERROR_SUB_INVALID_NETWORK_FIELD, eData, err.Error())
@@ -11814,6 +11838,10 @@ func (p *PathAttributeMpUnreachNLRI) DecodeFromBytes(data []byte, options ...*Ma
 		addpathLen = 4
 	}
 	for len(value) > 0 {
+		if n, ok := unknownEVPNNLRILen(afi, safi, value, addpathLen); ok {
+			value = value[n:]
+			continue
+		}
 		prefix, err := NewPrefixFromRouteFamily(afi, safi)
 		if err != nil {
 			return NewMessageError(eCode, BGP_ERROR_SUB_INVALID_NETWORK_FIELD, eData, err.Error())
