@@ -814,6 +814,14 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 		path = path.Clone(true)
 	}
 
+	// RFC 8950 section 4: a BGP speaker MUST only advertise IPv4 NLRI with
+	// an IPv6 next hop to a peer that advertised the Extended Next Hop
+	// Encoding capability for the family. Without it the peer cannot use
+	// the route, so it gets a withdrawal, as above.
+	if path != nil && !path.IsWithdraw && needsExtendedNexthop(path) && !peer.extendedNexthopFamily(path.GetRouteFamily()) {
+		path = path.Clone(true)
+	}
+
 	// remove local-pref attribute
 	// we should do this after applying export policy since policy may
 	// set local-preference
@@ -822,6 +830,17 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 	}
 
 	return path
+}
+
+// needsExtendedNexthop reports an IPv4 unicast, multicast, labeled unicast
+// or VPNv4 path with an IPv6 next hop (RFC 8950).
+func needsExtendedNexthop(path *table.Path) bool {
+	switch path.GetRouteFamily() {
+	case bgp.RF_IPv4_UC, bgp.RF_IPv4_MC, bgp.RF_IPv4_MPLS, bgp.RF_IPv4_VPN:
+		nh := path.GetNexthop()
+		return nh != nil && nh.To4() == nil
+	}
+	return false
 }
 
 func (s *BgpServer) filterpath(peer *peer, path, old *table.Path) *table.Path {

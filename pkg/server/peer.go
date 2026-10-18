@@ -395,6 +395,27 @@ func (peer *peer) llgrFamilies() ([]bgp.RouteFamily, []bgp.RouteFamily) {
 	return classifyFamilies(peer.configuredRFlist(), list)
 }
 
+// extendedNexthopFamily reports whether the peer advertised the Extended
+// Next Hop Encoding capability (RFC 8950) for the family with an IPv6 next
+// hop.
+func (peer *peer) extendedNexthopFamily(family bgp.RouteFamily) bool {
+	afi, safi := bgp.RouteFamilyToAfiSafi(family)
+	peer.fsm.lock.RLock()
+	defer peer.fsm.lock.RUnlock()
+	for _, c := range peer.fsm.capMap[bgp.BGP_CAP_EXTENDED_NEXTHOP] {
+		enhe, ok := c.(*bgp.CapExtendedNexthop)
+		if !ok {
+			continue
+		}
+		for _, t := range enhe.Tuples {
+			if t.NLRIAFI == afi && t.NLRISAFI == uint16(safi) && t.NexthopAFI == bgp.AFI_IP6 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (peer *peer) isLLGREnabledFamily(family bgp.RouteFamily) bool {
 	peer.fsm.lock.RLock()
 	llgrEnabled := peer.fsm.pConf.GracefulRestart.Config.LongLivedEnabled
