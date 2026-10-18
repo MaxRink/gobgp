@@ -312,14 +312,18 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn) {
 			fsm.lock.Unlock()
 			b, _ := open.Serialize()
 
+			// OpenSent before the OPEN goes out: an incoming connection
+			// that reaches OpenSent meanwhile must not stop this one
+			// after the peer got its OPEN.
+			ocm.state.Store(bgp.BGP_FSM_OPENSENT)
 			conn.SetWriteDeadline(time.Now().Add(time.Second))
 			if _, err := conn.Write(b); err != nil {
 				conn.Close()
+				ocm.state.Store(bgp.BGP_FSM_CONNECT)
 				continue
 			}
 			fsm.bgpMessageStateUpdate(bgp.BGP_MSG_OPEN, false)
 			fsm.logger.Debug("outgoing connection established")
-			ocm.state.Store(bgp.BGP_FSM_OPENSENT)
 		case bgp.BGP_FSM_OPENSENT:
 			recvCh := make(chan *fsmMsg, 1)
 			reasonCh := make(chan fsmStateReason, 1)
@@ -1035,7 +1039,9 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
 
-	if fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil {
+	// A connection that the last manager left in outgoingConnCh is taken
+	// below; a new manager would open another one to the peer.
+	if (fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil) && len(fsm.outgoingConnCh) == 0 {
 		fsm.logger.Info("starting outgoing connection manager")
 		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm)
 	}
@@ -1719,20 +1725,32 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 	fsm := h.fsm
 	ticker := keepaliveTicker(fsm)
 
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	reasonCh := make(chan fsmStateReason, 1)
-	recvChan := make(chan *fsmMsg, 1)
-	go h.recvMessage(ctx, fsm.conn, recvChan, reasonCh, wg)
-
-	defer func() {
+	// The recv goroutine reads fsm.conn; a collision can move it to the
+	// outgoing connection.
+	var wg *sync.WaitGroup
+	var reasonCh chan fsmStateReason
+	var recvChan chan *fsmMsg
+	startRecv := func() {
+		wg = &sync.WaitGroup{}
+		wg.Add(1)
+		reasonCh = make(chan fsmStateReason, 1)
+		recvChan = make(chan *fsmMsg, 1)
+		go h.recvMessage(ctx, fsm.conn, recvChan, reasonCh, wg)
+	}
+	stopRecv := func() {
+		if wg == nil {
+			return
+		}
 		// for to stop the recv goroutine
 		fsm.conn.SetReadDeadline(time.Now())
 		wg.Wait()
+		wg = nil
 		close(recvChan)
 		// reset the read deadline
 		fsm.conn.SetReadDeadline(time.Time{})
-	}()
+	}
+	startRecv()
+	defer stopRecv()
 
 	fsm.lock.Lock()
 	var holdTimer *time.Timer
@@ -1783,6 +1801,11 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 				}
 				// send notification ?
 				fsm.conn.Close()
+				if n, ok := m.Body.(*bgp.BGPNotification); ok && fsm.outgoingConnPending() {
+					// For example Cease/Connection Collision Resolution:
+					// the peer keeps the outgoing connection.
+					return bgp.BGP_FSM_ACTIVE, newfsmStateReason(fsmNotificationRecv, n, nil)
+				}
 				return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmInvalidMsg, nil, nil)
 			case *bgp.MessageError:
 				n := bgp.NewBGPNotificationMessage(m.TypeCode, m.SubTypeCode, m.Data)
@@ -1793,8 +1816,43 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 					slog.String("State", fsm.state.String()),
 					slog.Any("Data", e.MsgData))
 			}
+		case result := <-fsm.outgoingConnCh:
+			// The outgoing connection got the peer's OPEN while this one
+			// is in OpenConfirm: a connection collision (RFC 4271 Section
+			// 6.8). Keep the connection that the speaker with the higher
+			// BGP Identifier opened and close the other with Cease/
+			// Connection Collision Resolution.
+			notif := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil)
+			if !fsm.isDominant(result.open.Body.(*bgp.BGPOpen)) {
+				fsm.logger.Debug("collision detected in OpenConfirm: dominant on passive side, close the outgoing connection")
+				_ = fsm.sendNotification(result.conn, notif)
+				continue
+			}
+			fsm.logger.Debug("collision detected in OpenConfirm: dominant on active side, close the incoming connection")
+			stopRecv()
+			_ = fsm.sendNotification(fsm.conn, notif)
+			fsm.lock.Lock()
+			fsm.conn = result.conn
+			fsm.recvOpen = result.open
+			fsm.lock.Unlock()
+			b, _ := bgp.NewBGPKeepAliveMessage().Serialize()
+			fsm.conn.SetWriteDeadline(time.Now().Add(time.Second))
+			if _, err := fsm.conn.Write(b); err != nil {
+				fsm.conn.Close()
+				return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmWriteFailed, nil, nil)
+			}
+			fsm.bgpMessageStateUpdate(bgp.BGP_MSG_KEEPALIVE, false)
+			startRecv()
 		case err := <-reasonCh:
 			fsm.conn.Close()
+			if fsm.outgoingConnPending() {
+				// The peer closed this connection, for example to resolve
+				// a collision in favor of the outgoing connection, which
+				// already sent its OPEN. Wait for it in Active instead of
+				// holding the peer in Idle (RFC 4271 Section 6.8: the
+				// other connection is not affected).
+				return bgp.BGP_FSM_ACTIVE, &err
+			}
 			return bgp.BGP_FSM_IDLE, &err
 		case <-holdTimer.C:
 			m := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_HOLD_TIMER_EXPIRED, 0, nil)
@@ -1815,6 +1873,16 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			}
 		}
 	}
+}
+
+// outgoingConnPending reports whether the outgoing connection sent its
+// OPEN and waits for the peer's, or has it already.
+func (fsm *fsm) outgoingConnPending() bool {
+	if len(fsm.outgoingConnCh) > 0 {
+		return true
+	}
+	ocm := fsm.outgoingConnMgr
+	return ocm != nil && ocm.ctx.Err() == nil && ocm.state.Load() == bgp.BGP_FSM_OPENSENT
 }
 
 func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateReasonCh chan<- fsmStateReason, wg *sync.WaitGroup) error {
