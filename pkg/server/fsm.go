@@ -1875,6 +1875,34 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			if !ok {
 				break
 			}
+			fsm.lock.RLock()
+			grEnabled := fsm.pConf.GracefulRestart.State.Enabled
+			restartTime := fsm.pConf.GracefulRestart.State.PeerRestartTime
+			fsm.lock.RUnlock()
+			if grEnabled {
+				// RFC 4724 Section 4.2: a new connection from a peer
+				// that negotiated graceful restart means that the peer
+				// restarted. Close the old session as if its TCP
+				// connection had failed, keep the peer's routes as
+				// stale, and take the new connection in Active.
+				h.conn.Close()
+				err := *newfsmStateReason(fsmGracefulRestart, nil, nil)
+				h.outgoing.In() <- err
+				fsm.lock.RLock()
+				fsm.logger.Info("peer graceful restart: new connection while established",
+					log.Fields{
+						"Topic": "Peer",
+						"Key":   fsm.pConf.State.NeighborAddress,
+						"State": fsm.state.String()})
+				fsm.gracefulRestartTimer.Reset(time.Duration(restartTime) * time.Second)
+				fsm.lock.RUnlock()
+				select {
+				case fsm.connCh <- conn:
+				default:
+					conn.Close()
+				}
+				return bgp.BGP_FSM_ACTIVE, &err
+			}
 			conn.Close()
 			fsm.lock.RLock()
 			fsm.logger.Warn("Closed an accepted connection",
