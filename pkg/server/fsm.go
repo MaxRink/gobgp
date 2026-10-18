@@ -897,6 +897,10 @@ type fsmHandler struct {
 	// connections to resolve a collision (RFC 4271 Section 6.8); Active
 	// clears it. Only the handler goroutine uses it.
 	collided bool
+	// collisionLost is set by failedConn when both connections of a
+	// collision are gone; loop() then caps the next idle hold time at
+	// IdleHoldTimeAfterReset.
+	collisionLost bool
 }
 
 // failedConn picks the next state after the connection of OpenSent or
@@ -904,20 +908,14 @@ type fsmHandler struct {
 // OPEN, or has it, the FSM goes to Active and takes it there: the other
 // connection of a collision is not affected (RFC 4271 Section 6.8). When a
 // collision already closed the other connection, both are gone and the FSM
-// starts again after IdleHoldTimeAfterReset, as after a reset, instead of
-// the fixed idle hold time (never longer than that).
+// starts again after IdleHoldTimeAfterReset, as after a reset, when that is
+// shorter than the idle hold time that loop() picks for the reason.
 func (h *fsmHandler) failedConn(reason *fsmStateReason) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
 	if fsm.outgoingConnPending() {
 		return bgp.BGP_FSM_ACTIVE, reason
 	}
-	if h.collided {
-		fsm.lock.Lock()
-		if t := fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset; t < fsm.idleHoldTime {
-			fsm.idleHoldTime = t
-		}
-		fsm.lock.Unlock()
-	}
+	h.collisionLost = h.collided
 	return bgp.BGP_FSM_IDLE, reason
 }
 
@@ -948,6 +946,8 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
 
 	idleHoldTimer := time.NewTimer(time.Second * time.Duration(fsm.idleHoldTime))
+	// when the idle hold timer fires; zero while it is stopped
+	idleHoldDeadline := time.Now().Add(time.Second * time.Duration(fsm.idleHoldTime))
 
 	for {
 		select {
@@ -975,6 +975,16 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 			// is enabled.
 			if b := notificationBody(m); b != nil && b.ErrorCode == bgp.BGP_ERROR_CEASE && b.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET {
 				fsm.idleHoldTime = fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset
+				// A peer that is enabled already waits the idle hold
+				// time, for example after an administrative shutdown and
+				// a new start: the reset shortens the running timer to
+				// the idle hold time after reset, counted from now, and
+				// never makes it longer.
+				d := time.Second * time.Duration(fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset)
+				if !idleHoldDeadline.IsZero() && time.Now().Add(d).Before(idleHoldDeadline) {
+					idleHoldTimer.Reset(d)
+					idleHoldDeadline = time.Now().Add(d)
+				}
 			}
 		case <-idleHoldTimer.C:
 			if fsm.adminState.Load() == adminStateUp {
@@ -991,10 +1001,12 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 				case adminStateDown:
 					// stop idle hold timer
 					idleHoldTimer.Stop()
+					idleHoldDeadline = time.Time{}
 
 				case adminStateUp:
 					// restart idle hold timer
 					idleHoldTimer.Reset(time.Second * time.Duration(fsm.idleHoldTime))
+					idleHoldDeadline = time.Now().Add(time.Second * time.Duration(fsm.idleHoldTime))
 				}
 			}
 		}
@@ -2446,9 +2458,13 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 		case bgp.BGP_FSM_IDLE:
 			conf := fsm.pConf.ReadOnly()
 			fsm.idleHoldTime, fsm.idleHoldBackoff = nextIdleHoldTime(fsm.idleHoldBackoff, conf.Timers.Config.IdleHoldTimeAfterReset, reason)
+			if h.collisionLost {
+				fsm.idleHoldTime = min(fsm.idleHoldTime, conf.Timers.Config.IdleHoldTimeAfterReset)
+			}
 		case bgp.BGP_FSM_ESTABLISHED:
 			fsm.idleHoldBackoff = idleHoldTimeInitial
 		}
+		h.collisionLost = false
 
 		h.fsm.stateChange(nextState, reason)
 

@@ -247,7 +247,7 @@ func TestCollisionSimultaneousOpenFRRTiming(t *testing.T) {
 
 // When the connection that survived a collision fails too, both are gone:
 // GoBGP starts again after IdleHoldTimeAfterReset (1 s here), not after the
-// fixed idle hold time of 5 s.
+// idle hold time that the NOTIFICATION backs off to (2 s).
 func TestCollisionBothConnectionsDropped(t *testing.T) {
 	ctx := t.Context()
 	lc := &net.ListenConfig{}
@@ -294,6 +294,6 @@ func TestCollisionBothConnectionsDropped(t *testing.T) {
 	require.NoError(t, err)
 	defer again.Close()
 	took := time.Since(dropped)
-	require.Less(t, took, 3*time.Second, "GoBGP waited the fixed idle hold time")
+	require.Less(t, took, 1800*time.Millisecond, "GoBGP waited the backed-off idle hold time")
 	require.Greater(t, took, 500*time.Millisecond, "GoBGP did not wait IdleHoldTimeAfterReset")
 }

@@ -5736,6 +5736,59 @@ func TestResetPeerWhileAdminDownAppliesIdleHoldTimeAfterReset(t *testing.T) {
 	require.Less(t, time.Since(start), 3*time.Second, "idle hold time after reset (1 s) not applied")
 }
 
+// A reset that arrives while an enabled peer waits a backed-off idle hold
+// time shortens the running idle hold timer to IdleHoldTimeAfterReset,
+// counted from the reset. It never makes it longer.
+// https://github.com/osrg/gobgp/issues/3740
+func TestResetPeerShortensRunningIdleHoldTimer(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	for _, tt := range []struct {
+		name       string
+		afterReset float64
+		min, max   time.Duration
+	}{
+		{"after reset 1 s", 1, 500 * time.Millisecond, 2 * time.Second},
+		// 30 s is longer than the rest of the 4 s: the timer is kept
+		{"after reset 30 s", 30, 2500 * time.Millisecond, 6 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = tt.afterReset
+			})
+			ctx := context.Background()
+			m := establishSession(t, s, peer, asn, peerAddr)
+			notification := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil)
+
+			// A NOTIFICATION from the peer ends the session (idle hold
+			// time 2 s), another one ends the next connection (4 s).
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			m.PushBgpMessage(notification)
+			w.Wait(t, 10*time.Second)
+			waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+
+			m2 := NewMockConnection()
+			m2.SetRemoteAddr(peerAddr)
+			t.Cleanup(func() { m2.Close() })
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			peer.fsm.connCh <- m2
+			m2.PushBgpMessage(notification)
+			w.Wait(t, 10*time.Second)
+
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+			time.Sleep(500 * time.Millisecond)
+			start := time.Now()
+			require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, Communication: "BFD is down"}))
+			w.Wait(t, 40*time.Second)
+			took := time.Since(start)
+			require.Less(t, took, tt.max)
+			require.Greater(t, took, tt.min)
+		})
+	}
+}
+
 // A hard ResetPeer against an established peer must still tear the session
 // down promptly. The drain that fixes the stale-notification bug must not
 // suppress it.
