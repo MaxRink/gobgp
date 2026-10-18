@@ -432,3 +432,29 @@ func TestCapabilitiesExtendedNexthopIPv4Only(t *testing.T) {
 	}
 	require.Equal(t, []bgp.RouteFamily{bgp.RF_IPv4_UC, bgp.RF_IPv4_VPN, bgp.RF_IPv4_MPLS}, got)
 }
+
+// TestRecvMessageWithError_UnknownMessageType verifies that recvMessageWithError
+// handles an unknown BGP message type without panicking on nil dereference.
+// This is a regression test for https://github.com/osrg/gobgp/issues/3325.
+func TestRecvMessageWithError_UnknownMessageType(t *testing.T) {
+	assert := assert.New(t)
+
+	m := NewMockConnection(t)
+	_, h := makePeerAndHandler()
+	h.conn = m
+
+	// BGP message with unknown type 0xFF.
+	// ParseBGPBody returns (nil, error) for unknown types.
+	raw := []byte{
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // marker
+		0x00, 0x13, // length: 19 (header only, no body)
+		0xff, // type: unknown
+	}
+	m.setData(raw)
+
+	fmsg, err := h.recvMessageWithError()
+
+	assert.Error(err)
+	assert.NotNil(fmsg)
+}
