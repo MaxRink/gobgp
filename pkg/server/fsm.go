@@ -906,6 +906,32 @@ type fsmHandler struct {
 	collided bool
 }
 
+// closeCollisionLoserAtOpen keeps conn, which loses a collision, open until
+// the peer's first message arrives on it: an OPEN gets Cease/Connection
+// Collision Resolution (RFC 4271 Section 6.8), any other message the FSM Error
+// of OpenSent (Section 8.2.2), and conn is closed. A peer that resolves the
+// collision itself closes conn first. conn is also closed after the OpenSent
+// hold time and when the handler stops.
+func (h *fsmHandler) closeCollisionLoserAtOpen(conn net.Conn) {
+	fsm := h.fsm
+	stop := context.AfterFunc(h.ctx, func() { conn.Close() })
+	go func() {
+		defer stop()
+		defer conn.Close()
+		conn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(fsm.opensentHoldTime)))
+		hdr := make([]byte, bgp.BGP_HEADER_LENGTH)
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			return
+		}
+		n := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_FSM_ERROR, 1, nil)
+		if hdr[18] == bgp.BGP_MSG_OPEN {
+			n = bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil)
+			fsm.logger.Debug("collision detected: OPEN on the losing connection, close it")
+		}
+		_ = fsm.sendNotification(conn, n)
+	}()
+}
+
 // failedConn picks the next state after the connection of OpenSent or
 // OpenConfirm failed. While the outgoing connection waits for the peer's
 // OPEN, or has it, the FSM goes to Active and takes it there: the other
@@ -1760,7 +1786,19 @@ func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReaso
 			// stop the recv goroutine of the incoming connection
 			fsm.conn.SetReadDeadline(time.Now())
 			wg.Wait()
-			_ = fsm.sendNotification(fsm.conn, notif)
+			select {
+			case <-recvChan:
+				// The peer's OPEN on the incoming connection is
+				// there too: it loses at once.
+				_ = fsm.sendNotification(fsm.conn, notif)
+			default:
+				// RFC 4271 Section 6.8 detects the collision when
+				// the OPEN arrives: keep the incoming connection
+				// until then (FRR connects again when its own
+				// connection is closed before it saw the collision).
+				fsm.conn.SetReadDeadline(time.Time{})
+				h.closeCollisionLoserAtOpen(fsm.conn)
+			}
 			fsm.lock.Lock()
 			fsm.conn = result.conn
 			fsm.recvOpen = result.open
