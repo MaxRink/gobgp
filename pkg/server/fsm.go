@@ -1251,15 +1251,16 @@ func capabilitiesFromConfig(pConf *oc.Neighbor) []bgp.ParameterCapabilityInterfa
 		}
 	}
 
-	// Extended Nexthop Capability (Code 5)
+	// Extended Nexthop Capability (Code 5): IPv6 next hops for the IPv4
+	// families of RFC 8950 Section 3. Other families, for example L2VPN
+	// EVPN or IPv6 VPN, carry an IPv6 next hop without it.
 	tuples := []*bgp.CapExtendedNexthopTuple{}
 	families, _ := oc.AfiSafis(pConf.AfiSafis).ToRfList()
 	for _, family := range families {
-		if family == bgp.RF_IPv6_UC {
-			continue
+		switch family {
+		case bgp.RF_IPv4_UC, bgp.RF_IPv4_MC, bgp.RF_IPv4_MPLS, bgp.RF_IPv4_VPN, bgp.RF_IPv4_VPN_MC:
+			tuples = append(tuples, bgp.NewCapExtendedNexthopTuple(family, bgp.AFI_IP6))
 		}
-		tuple := bgp.NewCapExtendedNexthopTuple(family, bgp.AFI_IP6)
-		tuples = append(tuples, tuple)
 	}
 	if len(tuples) != 0 {
 		caps = append(caps, bgp.NewCapExtendedNexthop(tuples))
