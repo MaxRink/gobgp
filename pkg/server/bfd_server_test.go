@@ -474,7 +474,7 @@ func Test_ResetPeer(t *testing.T) {
 	s1.Stop()
 
 	assert.Equal(int64(1), atomic.LoadInt64(&m1.resetPeerCount))
-	assert.True(m1.bfdDown.Load(), "BFD resets the peer with Cease/BFD Down")
+	assert.False(m1.bfdDown.Load(), "the native BFD resets the peer with Administrative Reset by default")
 }
 
 func Test_BgpAddDeletePeer(t *testing.T) {
