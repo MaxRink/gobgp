@@ -586,6 +586,7 @@ message ExtendedCommunitiesAttribute {
   // - TrafficRemarkExtended
   // - MUPExtended
   // - VPLSExtended
+  // - ArpNdExtended
   // - UnknownExtended
   repeated google.protobuf.Any communities = 1;
 }
@@ -955,4 +956,13 @@ message LsSrv6SIDInformation {
 
 message LsMultiTopologyIdentifier {
   repeated uint32 multi_topo_ids = 1;
+}
+
+// EVPN ARP/ND Extended Community (RFC 9047).
+message ArpNdExtended {
+  bool is_router = 1;
+  bool is_override = 2;
+  // Proxy flag that FRR sends; RFC 9047 does not assign this bit.
+  bool is_proxy = 3;
+  bool is_immutable = 4;
 }

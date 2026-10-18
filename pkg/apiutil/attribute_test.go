@@ -1556,6 +1556,12 @@ func Test_ExtendedCommunitiesAttribute(t *testing.T) {
 	})
 	assert.Nil(err)
 	communities = append(communities, a)
+	a, err = apb.New(&api.ArpNdExtended{
+		IsRouter: true,
+		IsProxy:  true,
+	})
+	assert.Nil(err)
+	communities = append(communities, a)
 	a, err = apb.New(&api.TrafficRateExtended{
 		Asn:  65004,
 		Rate: 100.0,
@@ -1626,7 +1632,7 @@ func Test_ExtendedCommunitiesAttribute(t *testing.T) {
 	assert.Nil(err)
 
 	output, _ := NewExtendedCommunitiesAttributeFromNative(n.(*bgp.PathAttributeExtendedCommunities))
-	assert.Equal(22, len(output.Communities))
+	assert.Equal(23, len(output.Communities))
 	for idx, inputCommunity := range input.Communities {
 		outputCommunity := output.Communities[idx]
 		assert.Equal(inputCommunity.TypeUrl, outputCommunity.TypeUrl)
