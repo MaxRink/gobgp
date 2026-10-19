@@ -6002,11 +6002,7 @@ func TestPostFilterpathExtendedNexthop(t *testing.T) {
 	vpnNLRI, err := bgp.NewLabeledVPNIPAddrPrefix(prefix, *bgp.NewMPLSLabelStack(100), rd)
 	require.NoError(t, err)
 
-	enhe := func(families ...bgp.Family) map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface {
-		var tuples []*bgp.CapExtendedNexthopTuple
-		for _, f := range families {
-			tuples = append(tuples, bgp.NewCapExtendedNexthopTuple(f, bgp.AFI_IP6))
-		}
+	enhe := func(tuples ...*bgp.CapExtendedNexthopTuple) map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface {
 		return map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface{
 			bgp.BGP_CAP_EXTENDED_NEXTHOP: {bgp.NewCapExtendedNexthop(tuples)},
 		}
@@ -6017,7 +6013,7 @@ func TestPostFilterpathExtendedNexthop(t *testing.T) {
 		nlri   bgp.NLRI
 		other  bgp.Family
 	}{
-		{bgp.RF_IPv4_UC, ipNLRI, bgp.RF_IPv4_VPN},
+		{bgp.RF_IPv4_UC, ipNLRI, bgp.RF_IPv6_UC},
 		{bgp.RF_IPv4_MC, ipNLRI, bgp.RF_IPv4_UC},
 		{bgp.RF_IPv4_MPLS, labeledNLRI, bgp.RF_IPv4_UC},
 		{bgp.RF_IPv4_VPN, vpnNLRI, bgp.RF_IPv4_UC},
@@ -6033,8 +6029,10 @@ func TestPostFilterpathExtendedNexthop(t *testing.T) {
 				require.NoError(t, err)
 				return table.NewPath(tc.family, info, bgp.PathNLRI{NLRI: tc.nlri}, false, []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), reach}, time.Now(), false)
 			}
-			v6 := newPath("2001:db8::1")
 			v4 := newPath("192.0.2.1")
+			// An IPv4-mapped IPv6 address is sent as a 16 octet next hop,
+			// so it needs the capability too.
+			v6 := []string{"2001:db8::1", "::ffff:192.0.2.1"}
 
 			for _, c := range []struct {
 				name   string
@@ -6042,14 +6040,20 @@ func TestPostFilterpathExtendedNexthop(t *testing.T) {
 				v6Sent bool
 			}{
 				{"no capability", nil, false},
-				{"tuple for another family only", enhe(tc.other), false},
-				{"tuple for the family", enhe(tc.other, tc.family), true},
+				{
+					"tuple for another family and next hop AFI IPv4 only",
+					enhe(bgp.NewCapExtendedNexthopTuple(tc.other, bgp.AFI_IP6), bgp.NewCapExtendedNexthopTuple(tc.family, bgp.AFI_IP)),
+					false,
+				},
+				{"tuple for the family", enhe(bgp.NewCapExtendedNexthopTuple(tc.other, bgp.AFI_IP6), bgp.NewCapExtendedNexthopTuple(tc.family, bgp.AFI_IP6)), true},
 			} {
 				peer.fsm.capMap = c.capMap
-				got := s.postFilterpath(peer, v6)
-				require.NotNil(t, got, c.name)
-				require.Equal(t, !c.v6Sent, got.IsWithdraw, "%s: IPv6 next hop", c.name)
-				got = s.postFilterpath(peer, v4)
+				for _, nh := range v6 {
+					got := s.postFilterpath(peer, newPath(nh))
+					require.NotNil(t, got, c.name)
+					require.Equal(t, !c.v6Sent, got.IsWithdraw, "%s: next hop %s", c.name, nh)
+				}
+				got := s.postFilterpath(peer, v4)
 				require.NotNil(t, got, c.name)
 				require.False(t, got.IsWithdraw, "%s: IPv4 next hop", c.name)
 			}

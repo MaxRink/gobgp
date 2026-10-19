@@ -756,8 +756,7 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 func needsExtendedNexthop(path *table.Path) bool {
 	switch path.GetFamily() {
 	case bgp.RF_IPv4_UC, bgp.RF_IPv4_MC, bgp.RF_IPv4_MPLS, bgp.RF_IPv4_VPN, bgp.RF_IPv4_VPN_MC:
-		nh := path.GetNexthop()
-		return nh.IsValid() && nh.Is6() && !nh.Is4In6()
+		return path.GetNexthop().Is6()
 	}
 	return false
 }
