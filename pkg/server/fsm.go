@@ -317,11 +317,6 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, first bool) {
 				}
 				return
 			}
-			if conn == nil {
-				// connectLoop gave up: the FSM is in OpenConfirm or
-				// Established on the other connection.
-				return
-			}
 
 			fsm.lock.Lock()
 			initializeConn(fsm, conn)
@@ -1143,8 +1138,18 @@ func (h *fsmHandler) connectLoop(ctx context.Context, now bool, dialing *atomic.
 			timer.Stop()
 			return nil
 		case <-timer.C:
-			fsm.logger.Debug("try to connect")
 		}
+		// RFC 4271 Section 8.2.2 stops the ConnectRetryTimer in
+		// OpenConfirm: while the FSM goes on with the other connection,
+		// do not dial. Do not return either: the state can be stale (the
+		// handler may be in Active already), and connectLoop returns only
+		// when ctx ends, so the manager ends only when it is stopped.
+		if s := fsm.state.Load(); s == bgp.BGP_FSM_OPENCONFIRM || s == bgp.BGP_FSM_ESTABLISHED {
+			fsm.logger.Debug("no connect, the session goes on with the other connection")
+			tick = retryInterval
+			continue
+		}
+		fsm.logger.Debug("try to connect")
 
 		laddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localAddress, strconv.Itoa(localPort)))
 		if err != nil {
@@ -1189,13 +1194,6 @@ func (h *fsmHandler) connectLoop(ctx context.Context, now bool, dialing *atomic.
 			} else {
 				dialing.Store(false)
 				fsm.logger.Debug("failed to connect", slog.String("Error", err.Error()))
-			}
-			// RFC 4271 Section 8.2.2 stops the ConnectRetryTimer in
-			// OpenConfirm: the FSM went on with the other connection
-			// while this one was dialed, so do not connect again.
-			if s := fsm.state.Load(); s == bgp.BGP_FSM_OPENCONFIRM || s == bgp.BGP_FSM_ESTABLISHED {
-				fsm.logger.Debug("stop connect loop, the session goes on with the other connection")
-				return nil
 			}
 		}
 		tick = retryInterval
