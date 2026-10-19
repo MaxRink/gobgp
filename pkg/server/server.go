@@ -726,11 +726,17 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 		path = path.Clone(true)
 	}
 
-	// RFC 8950 section 4: a BGP speaker MUST only advertise IPv4 NLRI with
-	// an IPv6 next hop to a peer that advertised the Extended Next Hop
-	// Encoding capability for the family. Without it the peer cannot use
-	// the route, so it gets a withdrawal, as above.
+	// RFC 8950 Section 4:
+	//
+	//   A BGP speaker MUST only advertise the IPv4 or VPN-IPv4 NLRI with an
+	//   IPv6 next hop to a BGP peer if the BGP speaker has first ascertained
+	//   via the BGP Capability Advertisement that the BGP peer supports the
+	//   Extended Next Hop Encoding capability for the relevant AFI/SAFI pair.
+	//
+	// As above, we send a withdrawal even if we did not send the route.
 	if path != nil && !path.IsWithdraw && needsExtendedNexthop(path) && !peer.extendedNexthopFamily(path.GetFamily()) {
+		peer.fsm.logger.Debug("Peer did not advertise the Extended Next Hop Encoding capability for the family, not sending the path with an IPv6 next hop",
+			slog.Any("Path", path))
 		path = path.Clone(true)
 	}
 
@@ -744,11 +750,12 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 	return path
 }
 
-// needsExtendedNexthop reports an IPv4 unicast, multicast, labeled unicast
-// or VPNv4 path with an IPv6 next hop (RFC 8950).
+// needsExtendedNexthop reports a path with an IPv6 next hop in one of the
+// IPv4 families of RFC 8950 Section 4: unicast, multicast, labeled unicast,
+// VPN and VPN multicast.
 func needsExtendedNexthop(path *table.Path) bool {
 	switch path.GetFamily() {
-	case bgp.RF_IPv4_UC, bgp.RF_IPv4_MC, bgp.RF_IPv4_MPLS, bgp.RF_IPv4_VPN:
+	case bgp.RF_IPv4_UC, bgp.RF_IPv4_MC, bgp.RF_IPv4_MPLS, bgp.RF_IPv4_VPN, bgp.RF_IPv4_VPN_MC:
 		nh := path.GetNexthop()
 		return nh.IsValid() && nh.Is6() && !nh.Is4In6()
 	}

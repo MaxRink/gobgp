@@ -5989,33 +5989,71 @@ func TestUpdatePeerGroupSkipsDynamicNeighbor(t *testing.T) {
 	assert.Equal([]string{static}, members)
 }
 
-// RFC 8950 section 4: IPv4 NLRI with an IPv6 next hop only to a peer that
-// advertised the Extended Next Hop Encoding capability for IPv4 unicast.
+// RFC 8950 Section 4: an IPv4 or VPN-IPv4 path with an IPv6 next hop is sent
+// only to a peer that advertised the Extended Next Hop Encoding capability
+// for the family of the path.
 func TestPostFilterpathExtendedNexthop(t *testing.T) {
-	s := NewBgpServer()
-	rib := table.NewTableManager(logger, []bgp.Family{bgp.RF_IPv4_UC}, oc.RouteSelectionOptionsConfig{}, oc.UseMultiplePathsConfig{})
-	peer := newPeerandInfo(t, 65000, 65001, "fe80::2", rib)
-	info := peer.peerInfo.Load()
-	nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.17/32"))
+	prefix := netip.MustParsePrefix("192.0.2.17/32")
+	rd := bgp.NewRouteDistinguisherTwoOctetAS(65000, 100)
+	ipNLRI, err := bgp.NewIPAddrPrefix(prefix)
 	require.NoError(t, err)
-	reach, err := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv4_UC, []bgp.PathNLRI{{NLRI: nlri}}, netip.MustParseAddr("fe80::1"))
+	labeledNLRI, err := bgp.NewLabeledIPAddrPrefix(prefix, *bgp.NewMPLSLabelStack(100))
 	require.NoError(t, err)
-	nh, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.1"))
+	vpnNLRI, err := bgp.NewLabeledVPNIPAddrPrefix(prefix, *bgp.NewMPLSLabelStack(100), rd)
 	require.NoError(t, err)
-	v6 := table.NewPath(bgp.RF_IPv4_UC, info, bgp.PathNLRI{NLRI: nlri}, false, []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), reach}, time.Now(), false)
-	v4 := table.NewPath(bgp.RF_IPv4_UC, info, bgp.PathNLRI{NLRI: nlri}, false, []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), nh}, time.Now(), false)
 
-	if got := s.postFilterpath(peer, v6); got == nil || !got.IsWithdraw {
-		t.Fatalf("IPv6 next hop without the capability: got %v, want a withdrawal", got)
+	enhe := func(families ...bgp.Family) map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface {
+		var tuples []*bgp.CapExtendedNexthopTuple
+		for _, f := range families {
+			tuples = append(tuples, bgp.NewCapExtendedNexthopTuple(f, bgp.AFI_IP6))
+		}
+		return map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface{
+			bgp.BGP_CAP_EXTENDED_NEXTHOP: {bgp.NewCapExtendedNexthop(tuples)},
+		}
 	}
-	if got := s.postFilterpath(peer, v4); got == nil || got.IsWithdraw {
-		t.Fatalf("IPv4 next hop: got %v, want the path", got)
-	}
-	peer.fsm.capMap = map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface{
-		bgp.BGP_CAP_EXTENDED_NEXTHOP: {bgp.NewCapExtendedNexthop([]*bgp.CapExtendedNexthopTuple{bgp.NewCapExtendedNexthopTuple(bgp.RF_IPv4_UC, bgp.AFI_IP6)})},
-	}
-	if got := s.postFilterpath(peer, v6); got == nil || got.IsWithdraw {
-		t.Fatalf("IPv6 next hop with the capability: got %v, want the path", got)
+
+	for _, tc := range []struct {
+		family bgp.Family
+		nlri   bgp.NLRI
+		other  bgp.Family
+	}{
+		{bgp.RF_IPv4_UC, ipNLRI, bgp.RF_IPv4_VPN},
+		{bgp.RF_IPv4_MC, ipNLRI, bgp.RF_IPv4_UC},
+		{bgp.RF_IPv4_MPLS, labeledNLRI, bgp.RF_IPv4_UC},
+		{bgp.RF_IPv4_VPN, vpnNLRI, bgp.RF_IPv4_UC},
+		{bgp.RF_IPv4_VPN_MC, vpnNLRI, bgp.RF_IPv4_VPN},
+	} {
+		t.Run(tc.family.String(), func(t *testing.T) {
+			s := NewBgpServer()
+			rib := table.NewTableManager(logger, []bgp.Family{tc.family}, oc.RouteSelectionOptionsConfig{}, oc.UseMultiplePathsConfig{})
+			peer := newPeerandInfo(t, 65000, 65001, "2001:db8::2", rib)
+			info := peer.peerInfo.Load()
+			newPath := func(nexthop string) *table.Path {
+				reach, err := bgp.NewPathAttributeMpReachNLRI(tc.family, []bgp.PathNLRI{{NLRI: tc.nlri}}, netip.MustParseAddr(nexthop))
+				require.NoError(t, err)
+				return table.NewPath(tc.family, info, bgp.PathNLRI{NLRI: tc.nlri}, false, []bgp.PathAttributeInterface{bgp.NewPathAttributeOrigin(0), reach}, time.Now(), false)
+			}
+			v6 := newPath("2001:db8::1")
+			v4 := newPath("192.0.2.1")
+
+			for _, c := range []struct {
+				name   string
+				capMap map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface
+				v6Sent bool
+			}{
+				{"no capability", nil, false},
+				{"tuple for another family only", enhe(tc.other), false},
+				{"tuple for the family", enhe(tc.other, tc.family), true},
+			} {
+				peer.fsm.capMap = c.capMap
+				got := s.postFilterpath(peer, v6)
+				require.NotNil(t, got, c.name)
+				require.Equal(t, !c.v6Sent, got.IsWithdraw, "%s: IPv6 next hop", c.name)
+				got = s.postFilterpath(peer, v4)
+				require.NotNil(t, got, c.name)
+				require.False(t, got.IsWithdraw, "%s: IPv4 next hop", c.name)
+			}
+		})
 	}
 }
 
