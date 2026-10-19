@@ -2111,6 +2111,46 @@ func TestFSMHandlerOpenconfirm_IncomingClosedWhileOutgoingPending(t *testing.T) 
 	require.Equal(t, bgp.BGP_FSM_IDLE, state)
 }
 
+// The production template lab with ConnectAtOnce (BOOTy #811): the peer's
+// OPEN arrives on the incoming connection while the outgoing connection is
+// dialed but has not sent its OPEN yet. The speaker must not stop the
+// outgoing connection manager: the peer, with the lower BGP Identifier,
+// keeps the speaker's connection (RFC 4271 Section 6.8) and closes the
+// incoming one with Cease/Connection Collision Resolution. With both closed
+// the speaker went to Idle for 5 s. It now waits for its own connection in
+// Active.
+func TestFSMHandlerOpensent_DialedOutgoingConnKeptForCollision(t *testing.T) {
+	p, h, in := collisionHandler(t, "10.0.0.9")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ocm := &outgoingConnManager{ctx: ctx, cancel: cancel, fsm: p.fsm}
+	ocm.state.Store(bgp.BGP_FSM_CONNECT)
+	ocm.dialing.Store(true)
+	p.fsm.outgoingConnMgr = ocm
+	go in.PushBgpMessage(openFrom(t, "10.0.0.1"))
+
+	state, _ := h.opensent(t.Context())
+	require.Equal(t, bgp.BGP_FSM_OPENCONFIRM, state)
+	require.NoError(t, ocm.ctx.Err(), "the dialed outgoing connection was stopped")
+
+	go in.PushBgpMessage(bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil))
+	state, _ = h.openconfirm(t.Context())
+	require.Equal(t, bgp.BGP_FSM_ACTIVE, state)
+
+	// A manager that only waits to dial is stopped, as before: there is no
+	// other connection.
+	p2, h2, in2 := collisionHandler(t, "10.0.0.9")
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	defer cancel2()
+	waiting := &outgoingConnManager{ctx: ctx2, cancel: cancel2, fsm: p2.fsm}
+	waiting.state.Store(bgp.BGP_FSM_CONNECT)
+	p2.fsm.outgoingConnMgr = waiting
+	go in2.PushBgpMessage(openFrom(t, "10.0.0.1"))
+	state, _ = h2.opensent(t.Context())
+	require.Equal(t, bgp.BGP_FSM_OPENCONFIRM, state)
+	require.Error(t, waiting.ctx.Err(), "the waiting manager was not stopped")
+}
+
 // Active takes a connection that the last outgoing connection manager
 // left in outgoingConnCh without starting a new manager, which would open
 // another connection to the peer.
