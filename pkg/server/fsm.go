@@ -264,8 +264,10 @@ type outgoingConnManager struct {
 	wg     sync.WaitGroup
 	fsm    *fsm
 	state  fsmState
-	// dialing is set from the start of a dial until the connection fails or
-	// the manager returns: the peer can see this connection already.
+	// dialing is set when a dial starts and cleared when it fails: the peer
+	// can see this connection already. It stays set for a connection that
+	// the manager hands over or closes; outgoingConnPending checks ctx.Err
+	// first, which is set once the manager returns.
 	dialing atomic.Bool
 }
 
@@ -313,6 +315,11 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, first bool) {
 				if conn != nil {
 					conn.Close()
 				}
+				return
+			}
+			if conn == nil {
+				// connectLoop gave up: the FSM is in OpenConfirm or
+				// Established on the other connection.
 				return
 			}
 
@@ -1182,6 +1189,13 @@ func (h *fsmHandler) connectLoop(ctx context.Context, now bool, dialing *atomic.
 			} else {
 				dialing.Store(false)
 				fsm.logger.Debug("failed to connect", slog.String("Error", err.Error()))
+			}
+			// RFC 4271 Section 8.2.2 stops the ConnectRetryTimer in
+			// OpenConfirm: the FSM went on with the other connection
+			// while this one was dialed, so do not connect again.
+			if s := fsm.state.Load(); s == bgp.BGP_FSM_OPENCONFIRM || s == bgp.BGP_FSM_ESTABLISHED {
+				fsm.logger.Debug("stop connect loop, the session goes on with the other connection")
+				return nil
 			}
 		}
 		tick = retryInterval
