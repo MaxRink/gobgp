@@ -2111,10 +2111,10 @@ func TestConnectLoopWaitsInOpenConfirm(t *testing.T) {
 	}
 }
 
-// The outgoing connection manager keeps running when its dial fails while
-// the FSM state is OpenConfirm; with the state stale (the handler already in
-// Active), a manager that ended left Active without one.
-func TestOutgoingConnManagerSurvivesFailedDialInOpenConfirm(t *testing.T) {
+// The outgoing connection manager keeps running while the FSM state is
+// OpenConfirm (it does not dial then); with the state stale (the handler
+// already in Active), a manager that ended left Active without one.
+func TestOutgoingConnManagerKeepsRunningInOpenConfirm(t *testing.T) {
 	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := l.Addr().(*net.TCPAddr).Port
@@ -2152,4 +2152,41 @@ func TestConnectLoopReturnsNilOnlyWhenStopped(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("connectLoop did not return when its context ended")
 	}
+}
+
+// countingHandler counts the log records with message msg.
+type countingHandler struct {
+	slog.Handler
+	msg string
+	n   *atomic.Int32
+}
+
+func (c countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c countingHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == c.msg {
+		c.n.Add(1)
+	}
+	return nil
+}
+
+func (c countingHandler) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+// In OpenConfirm connectLoop skips the dial once per connect retry tick
+// (0.75 to 1 times at least 2 s), not in a busy loop: over 2.5 s that is the
+// skip at once and one more.
+func TestConnectLoopSkipTickSpacingInOpenConfirm(t *testing.T) {
+	port, _ := acceptOnce(t)
+	p, h := connectHandler(t, port)
+	var skips atomic.Int32
+	p.fsm.logger = slog.New(countingHandler{Handler: slog.DiscardHandler, msg: "no connect, the session goes on with the other connection", n: &skips})
+	p.fsm.state.Store(bgp.BGP_FSM_OPENCONFIRM)
+	ctx, cancel := context.WithCancel(t.Context())
+	var dialing atomic.Bool
+	done := make(chan net.Conn, 1)
+	go func() { done <- h.connectLoop(ctx, true, &dialing) }()
+	time.Sleep(2500 * time.Millisecond)
+	cancel()
+	require.Nil(t, <-done)
+	require.Equal(t, int32(2), skips.Load(), "skips in 2.5 s")
 }
