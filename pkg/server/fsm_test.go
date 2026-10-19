@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2234,4 +2235,60 @@ func TestCapabilitiesPathsLimit(t *testing.T) {
 	require.Equal(t, []*bgp.CapPathsLimitTuple{{Family: bgp.RF_IPv4_UC, Limit: 0}}, limits(afs))
 	require.Nil(t, limits(afs[1:]), "ADD-PATH send only")
 	require.Nil(t, limits(afs[2:]), "no ADD-PATH")
+}
+
+// connectHandler is a handler whose connectLoop dials 127.0.0.1:port.
+func connectHandler(t *testing.T, port int) (*peer, *fsmHandler) {
+	t.Helper()
+	p, h := makePeerAndHandler(NewMockConnection())
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	p.fsm.lock.Lock()
+	conf := p.fsm.pConf.ReadCopy()
+	conf.State.NeighborAddress = netip.MustParseAddr("127.0.0.1")
+	conf.Transport.Config.RemotePort = uint16(port)
+	conf.Transport.Config.LocalAddress = netip.MustParseAddr("127.0.0.1")
+	p.fsm.pConf.Update(&conf)
+	p.fsm.lock.Unlock()
+	return p, h
+}
+
+// connectLoop marks the outgoing connection as dialed: OpenSent must not
+// stop a manager whose connection the peer can already see.
+func TestConnectLoopMarksDialed(t *testing.T) {
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		if c, err := l.Accept(); err == nil {
+			t.Cleanup(func() { c.Close() })
+		}
+	}()
+	_, h := connectHandler(t, l.Addr().(*net.TCPAddr).Port)
+	var dialing atomic.Bool
+	conn := h.connectLoop(t.Context(), true, &dialing)
+	require.NotNil(t, conn)
+	t.Cleanup(func() { conn.Close() })
+	require.True(t, dialing.Load(), "a dialed connection is not marked")
+}
+
+// RFC 4271 stops the ConnectRetryTimer in OpenConfirm: when the FSM is in
+// OpenConfirm on the other connection and the outgoing connection fails,
+// connectLoop returns instead of connecting again.
+func TestConnectLoopNoRetryInOpenConfirm(t *testing.T) {
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close()) // connections are refused
+	p, h := connectHandler(t, port)
+	p.fsm.state.Store(bgp.BGP_FSM_OPENCONFIRM)
+	var dialing atomic.Bool
+	done := make(chan net.Conn, 1)
+	go func() { done <- h.connectLoop(t.Context(), true, &dialing) }()
+	select {
+	case conn := <-done:
+		require.Nil(t, conn)
+		require.False(t, dialing.Load())
+	case <-time.After(time.Second):
+		t.Fatal("connectLoop connects again in OpenConfirm")
+	}
 }
