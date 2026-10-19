@@ -264,6 +264,9 @@ type outgoingConnManager struct {
 	wg     sync.WaitGroup
 	fsm    *fsm
 	state  fsmState
+	// dialing is set from the start of a dial until the connection fails or
+	// the manager returns: the peer can see this connection already.
+	dialing atomic.Bool
 }
 
 // newOutGoingConnManager starts connecting to the peer. With now the first
@@ -302,7 +305,8 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, first bool) {
 	for {
 		switch ocm.state.Load() {
 		case bgp.BGP_FSM_CONNECT:
-			conn = ocm.fsm.h.connectLoop(ocm.ctx, first)
+			ocm.dialing.Store(false)
+			conn = ocm.fsm.h.connectLoop(ocm.ctx, first, &ocm.dialing)
 			first = false
 			if ocm.ctx.Err() != nil {
 				// right after connectLoop() returns a connection, the context may be canceled.
@@ -1087,7 +1091,7 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 // once, like the Connect state of other implementations (FRR connects
 // when BGP_Start runs); otherwise, and for the retries, it waits a
 // jittered delay.
-func (h *fsmHandler) connectLoop(ctx context.Context, now bool) net.Conn {
+func (h *fsmHandler) connectLoop(ctx context.Context, now bool, dialing *atomic.Bool) net.Conn {
 	fsm := h.fsm
 
 	retryInterval, addr, port, password, ttl, ttlMin, mss, localAddress, localPort, bindInterface, tos := func() (int, netip.Addr, int, string, uint8, uint8, uint16, string, int, string, uint8) {
@@ -1161,6 +1165,7 @@ func (h *fsmHandler) connectLoop(ctx context.Context, now bool) net.Conn {
 					return netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos, tcpAO)
 				},
 			}
+			dialing.Store(true)
 			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), strconv.Itoa(port)))
 			select {
 			case <-ctx.Done():
@@ -1175,6 +1180,7 @@ func (h *fsmHandler) connectLoop(ctx context.Context, now bool) net.Conn {
 			if err == nil {
 				return conn
 			} else {
+				dialing.Store(false)
 				fsm.logger.Debug("failed to connect", slog.String("Error", err.Error()))
 			}
 		}
@@ -1821,9 +1827,12 @@ func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReaso
 				fsm.conn.Close()
 				return h.failedConn(newfsmStateReason(fsmWriteFailed, nil, nil))
 			}
-			// stop to try to connect.
-			if fsm.outgoingConnMgr.state.Load() == bgp.BGP_FSM_CONNECT {
-				fsm.outgoingConnMgr.stop()
+			// Stop trying to connect, unless the outgoing connection is
+			// dialed already: the peer sees it too, and with the lower BGP
+			// Identifier it keeps that connection and closes this one
+			// (RFC 4271 Section 6.8). Then the FSM takes it in Active.
+			if ocm := fsm.outgoingConnMgr; ocm != nil && ocm.state.Load() == bgp.BGP_FSM_CONNECT && !ocm.dialing.Load() {
+				ocm.stop()
 			}
 
 			fsm.bgpMessageStateUpdate(bgp.BGP_MSG_KEEPALIVE, false)
@@ -2058,14 +2067,14 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 	}
 }
 
-// outgoingConnPending reports whether the outgoing connection sent its
-// OPEN and waits for the peer's, or has it already.
+// outgoingConnPending reports whether the outgoing connection is dialed or
+// dialing, sent its OPEN and waits for the peer's, or has it already.
 func (fsm *fsm) outgoingConnPending() bool {
 	if len(fsm.outgoingConnCh) > 0 {
 		return true
 	}
 	ocm := fsm.outgoingConnMgr
-	return ocm != nil && ocm.ctx.Err() == nil && ocm.state.Load() == bgp.BGP_FSM_OPENSENT
+	return ocm != nil && ocm.ctx.Err() == nil && (ocm.state.Load() == bgp.BGP_FSM_OPENSENT || ocm.dialing.Load())
 }
 
 func (h *fsmHandler) sendMessageloop(ctx context.Context, conn net.Conn, stateReasonCh chan<- fsmStateReason, wg *sync.WaitGroup) error {
