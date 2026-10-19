@@ -1337,7 +1337,7 @@ func TestRecvMessageWithError_MalformedNextHop(t *testing.T) {
 		// handled inside recvMessageWithError. The panic only occurs when
 		// treat-as-withdraw is enabled and the malformed attribute survives
 		// into ValidateUpdateMsg.
-		h.fsm.isTreatAsWithdraw = true
+		h.fsm.isTreatAsWithdraw.Store(true)
 
 		go m.remote.Write(raw)
 
@@ -1361,7 +1361,7 @@ func TestRecvMessageWithError_MalformedNextHop(t *testing.T) {
 		})
 
 		// Without RFC 7606, the error should cause a session reset.
-		h.fsm.isTreatAsWithdraw = false
+		h.fsm.isTreatAsWithdraw.Store(false)
 
 		go m.remote.Write(raw)
 
@@ -1848,7 +1848,7 @@ func recvUpdate(t *testing.T, raw []byte) (*fsmMsg, *bgp.BGPMessage) {
 	p, h := makePeerAndHandler(m)
 	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
 
-	h.fsm.isTreatAsWithdraw = true
+	h.fsm.isTreatAsWithdraw.Store(true)
 	h.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_NONE})
 
 	received := make(chan *fsmMsg, 1)
