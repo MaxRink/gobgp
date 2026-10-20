@@ -148,3 +148,58 @@ func TestAdminDownKeepsGracefulRestartRoutesUntilRestartTimer(t *testing.T) {
 		"the restart timer did not expire in Idle")
 	require.Greater(t, time.Since(start), 2500*time.Millisecond, "the stale routes went before the restart time (3 s)")
 }
+// The peer sent graceful restart tuples in session 1 and is helper-only in
+// session 2. A late second connection during session 2 is a collision:
+// RFC 4724 Section 5 looks at the capability of the current session, and
+// FRR recomputes PEER_STATUS_NSF_MODE for each session (bgp_fsm.c).
+func TestNewConnectionAfterTuplesFromEarlierSessionIsCollision(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.GracefulRestart.Config.Enabled = true
+		n.GracefulRestart.Config.HelperOnly = true
+		n.GracefulRestart.Config.RestartTime = 120
+		n.AfiSafis[0].MpGracefulRestart.Config.Enabled = true
+		n.Timers.Config.IdleHoldTimeAfterReset = 1
+	})
+	withTuples := []bgp.ParameterCapabilityInterface{
+		bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC),
+		bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, true)}),
+	}
+	helperOnly := []bgp.ParameterCapabilityInterface{
+		bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC),
+		bgp.NewCapGracefulRestart(false, false, 120, nil),
+	}
+
+	m1 := NewMockConnection()
+	m1.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m1.Close() })
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+	peer.fsm.connCh <- m1
+	pushOpen(t, m1, asn, peerAddr, withTuples...)
+	w.Wait(t, 10*time.Second)
+
+	// End session 1 with a reset (no graceful restart).
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+	require.NoError(t, s.ResetPeer(context.Background(), &api.ResetPeerRequest{Address: peerAddr}))
+	w.Wait(t, 10*time.Second)
+
+	m2 := NewMockConnection()
+	m2.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m2.Close() })
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+	peer.fsm.connCh <- m2
+	pushOpen(t, m2, asn, peerAddr, helperOnly...)
+	w.Wait(t, 10*time.Second)
+
+	m3 := NewMockConnection()
+	m3.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m3.Close() })
+	peer.PassConn(m3)
+	require.Never(t, func() bool {
+		return peer.State() != bgp.BGP_FSM_ESTABLISHED
+	}, 2*time.Second, 10*time.Millisecond, "a helper-only session 2 ended because session 1 sent GR tuples")
+}
+

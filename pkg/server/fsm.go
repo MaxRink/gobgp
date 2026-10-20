@@ -944,19 +944,23 @@ func isVersionError(n *bgp.BGPNotification) bool {
 	return n.ErrorCode == bgp.BGP_ERROR_OPEN_MESSAGE_ERROR && n.ErrorSubcode == bgp.BGP_ERROR_SUB_UNSUPPORTED_VERSION_NUMBER
 }
 
-// receivedGracefulRestartTuples reports whether the peer sent at least one
-// AFI/SAFI tuple in its graceful restart capability. RFC 4724 Section 5
-// (Events 16 and 17) treats a new connection while Established as a
-// restart only for such a peer; FRR likewise (bgp_accept acts only with
-// PEER_STATUS_NSF_MODE, which is set only for a family with
-// PEER_CAP_RESTART_AF_RCV).
-func receivedGracefulRestartTuples(conf *oc.Neighbor) bool {
-	for _, a := range conf.AfiSafis {
-		if a.MpGracefulRestart.State.Received {
-			return true
-		}
+// peerSentGracefulRestartTuples reports whether the peer sent at least one
+// AFI/SAFI tuple in the graceful restart capability of the current
+// session. RFC 4724 Section 5 (Events 16 and 17) treats a new connection
+// while Established as a restart only for such a peer; FRR likewise
+// (bgp_accept acts only with PEER_STATUS_NSF_MODE, which bgp_establish
+// computes for each session from PEER_CAP_RESTART_AF_RCV). The per-family
+// MpGracefulRestart.State.Received is not used: it is never cleared, so it
+// still holds the tuples of an earlier session.
+func (fsm *fsm) peerSentGracefulRestartTuples() bool {
+	fsm.lock.Lock()
+	defer fsm.lock.Unlock()
+	gr := fsm.capMap[bgp.BGP_CAP_GRACEFUL_RESTART]
+	if len(gr) == 0 {
+		return false
 	}
-	return false
+	c, ok := gr[len(gr)-1].(*bgp.CapGracefulRestart)
+	return ok && len(c.Tuples) > 0
 }
 
 // takeBfdDownReset reports whether m, taken from fsm.notification, is the
@@ -2484,7 +2488,7 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 				break
 			}
 			conf := fsm.pConf.ReadOnly()
-			if conf.GracefulRestart.State.Enabled && receivedGracefulRestartTuples(conf) {
+			if conf.GracefulRestart.State.Enabled && fsm.peerSentGracefulRestartTuples() {
 				// RFC 4724 Section 4.2: a new connection from a peer
 				// that negotiated graceful restart means that the peer
 				// restarted. Close the old session as if its TCP
