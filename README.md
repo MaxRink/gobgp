@@ -82,3 +82,5 @@ not have yet, released as the tags `v4.10.0-booty.N` from
 branch `booty/v4.10` (based on v4.10.0). Do not use `v4.10.0-booty.7`: it
 stops answering a NOTIFICATION in OpenSent, which RFC 4271 Section 8.2.2
 does not allow. `v4.10.0-booty.8` and later answer it again.
+Since `v4.10.0-booty.22` a neighbor set entry can carry an IPv6 zone
+("fe80::1%eth0/128") that must match the zone of the neighbor address.

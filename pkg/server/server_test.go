@@ -6834,3 +6834,32 @@ func TestEnhancedRouteRefreshBoRRBeforeEoR(t *testing.T) {
 	peer.fsm.lock.Unlock()
 	require.Zero(t, n)
 }
+
+// A neighbor set entry may carry an IPv6 zone so that link-local peers with
+// the same address on different interfaces get their own sets. The API must
+// accept it, keep it on list and remove exactly that entry on delete.
+func TestAddDefinedSetNeighborZone(t *testing.T) {
+	ctx := context.Background()
+	s := NewBgpServer()
+	go s.Serve()
+	require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{Asn: 1, RouterId: "1.1.1.1", ListenPort: -1}}))
+	defer s.StopBgp(ctx, &api.StopBgpRequest{})
+
+	set := func(list ...string) *api.DefinedSet {
+		return &api.DefinedSet{DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR, Name: "ll", List: list}
+	}
+	list := func() []string {
+		var got []string
+		require.NoError(t, s.ListDefinedSet(ctx, &api.ListDefinedSetRequest{DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR, Name: "ll"}, func(ds *api.DefinedSet) {
+			got = append(got, ds.List...)
+		}))
+		return got
+	}
+
+	require.NoError(t, s.AddDefinedSet(ctx, &api.AddDefinedSetRequest{DefinedSet: set("fe80::1%eth0/128", "fe80::1%eth1/128")}))
+	assert.Equal(t, []string{"fe80::1%eth0/128", "fe80::1%eth1/128"}, list())
+	require.NoError(t, s.DeleteDefinedSet(ctx, &api.DeleteDefinedSetRequest{DefinedSet: set("fe80::1%eth1/128")}))
+	assert.Equal(t, []string{"fe80::1%eth0/128"}, list())
+
+	assert.Error(t, s.AddDefinedSet(ctx, &api.AddDefinedSetRequest{DefinedSet: set("10.0.0.1%eth0/32")}))
+}

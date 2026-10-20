@@ -4679,3 +4679,72 @@ func TestPrefixSetMatchEVPN(t *testing.T) {
 		})
 	}
 }
+
+func newZoneTestPath(addr string) *Path {
+	peer := &PeerInfo{AS: 65001, Address: netip.MustParseAddr(addr)}
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("2001:db8::/64"))
+	mp, _ := bgp.NewPathAttributeMpReachNLRI(bgp.RF_IPv6_UC, []bgp.PathNLRI{{NLRI: nlri}}, netip.MustParseAddr(addr))
+	msg := bgp.NewBGPUpdateMessage(nil, []bgp.PathAttributeInterface{mp, bgp.NewPathAttributeOrigin(0)}, nil)
+	return ProcessMessage(msg, peer, time.Now(), false)[0]
+}
+
+// Two unnumbered peers on different interfaces can share one link-local
+// address (fe80::1 on every switch port). A zoned neighbor set entry must
+// match only the peer on its own interface, for the path source (import) and
+// for PolicyOptions.Info (export). An entry without a zone keeps matching
+// every zone, as before.
+func TestNeighborConditionZone(t *testing.T) {
+	cond := func(entries ...string) *NeighborCondition {
+		s, err := NewNeighborSet(oc.NeighborSet{NeighborSetName: "ns", NeighborInfoList: entries})
+		require.NoError(t, err)
+		return &NeighborCondition{set: s}
+	}
+	eth0, eth1, bare := newZoneTestPath("fe80::1%eth0"), newZoneTestPath("fe80::1%eth1"), newZoneTestPath("fe80::1")
+	exportTo := func(addr string) *PolicyOptions {
+		return &PolicyOptions{Info: &PeerInfo{Address: netip.MustParseAddr(addr)}}
+	}
+
+	for _, entry := range []string{"fe80::1%eth0/128", "fe80::1%eth0", "fe80::%eth0/64"} {
+		c := cond(entry)
+		assert.True(t, c.Evaluate(eth0, nil), entry)
+		assert.False(t, c.Evaluate(eth1, nil), entry)
+		assert.False(t, c.Evaluate(bare, nil), entry)
+		assert.True(t, c.Evaluate(eth1, exportTo("fe80::1%eth0")), entry)
+		assert.False(t, c.Evaluate(eth0, exportTo("fe80::1%eth1")), entry)
+	}
+
+	// No zone: matches every zone and the unzoned address, as before.
+	for _, entry := range []string{"fe80::1/128", "fe80::1"} {
+		c := cond(entry)
+		assert.True(t, c.Evaluate(eth0, nil), entry)
+		assert.True(t, c.Evaluate(eth1, nil), entry)
+		assert.True(t, c.Evaluate(bare, nil), entry)
+	}
+
+	// The string form keeps the zone, so Remove and ToConfig round-trip.
+	s := cond("fe80::1%eth0/128", "fe80::1%eth1/128", "10.0.0.1").set
+	assert.Equal(t, []string{"fe80::1%eth0/128", "fe80::1%eth1/128", "10.0.0.1/32"}, s.List())
+	require.NoError(t, s.Remove(cond("fe80::1%eth1/128").set))
+	assert.Equal(t, []string{"fe80::1%eth0/128", "10.0.0.1/32"}, s.List())
+
+	for _, bad := range []string{"10.0.0.1%eth0/32", "10.0.0.1%eth0", "fe80::1%/128", "fe80::1%eth0%x/128"} {
+		_, err := NewNeighborSet(oc.NeighborSet{NeighborSetName: "ns", NeighborInfoList: []string{bad}})
+		assert.Error(t, err, bad)
+	}
+}
+
+// One port's reject statement must not land on the other port's session with
+// the same link-local address.
+func TestNeighborSetZonePolicyPerInterface(t *testing.T) {
+	ds := oc.DefinedSets{NeighborSets: []oc.NeighborSet{
+		{NeighborSetName: "eth0", NeighborInfoList: []string{"fe80::1%eth0/128"}},
+	}}
+	r := NewRoutingPolicy(logger)
+	require.NoError(t, r.reload(createRoutingPolicy(ds, createPolicyDefinition("pd", createStatement("reject-eth0", "", "eth0", false)))))
+	p := r.policyMap["pd"]
+
+	typ, _ := p.Apply(logger, newZoneTestPath("fe80::1%eth0"), nil)
+	assert.Equal(t, ROUTE_TYPE_REJECT, typ)
+	typ, _ = p.Apply(logger, newZoneTestPath("fe80::1%eth1"), nil)
+	assert.Equal(t, ROUTE_TYPE_NONE, typ)
+}
