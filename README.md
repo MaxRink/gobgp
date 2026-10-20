@@ -77,7 +77,8 @@ license text.
 This branch is upstream GoBGP master at 57fa92f1 (2026-10-20, after
 v4.10.0) with the fixes and features that BOOTy needs and upstream does
 not have yet, released as the tags `v4.10.0-booty.N` from
-`v4.10.0-booty.17` on. The tags up to `v4.10.0-booty.16` are on the
+`v4.10.0-booty.17` on. The idle hold time backs off like v_start of FRR
+10.2.1 (since `v4.10.0-booty.19`), not like upstream 4e70e768. The tags up to `v4.10.0-booty.16` are on the
 branch `booty/v4.10` (based on v4.10.0). Do not use `v4.10.0-booty.7`: it
 stops answering a NOTIFICATION in OpenSent, which RFC 4271 Section 8.2.2
 does not allow. `v4.10.0-booty.8` and later answer it again.
