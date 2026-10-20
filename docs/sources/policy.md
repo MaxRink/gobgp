@@ -357,6 +357,12 @@ a condition.
 | ------- | ---------------- | ------------ | -------- |
 | address | neighbor address | "10.0.255.1" |          |
 
+An address or prefix can carry an IPv6 zone, for example
+"fe80::1%eth0/128". Such an entry matches only a neighbor with that zone, so
+unnumbered peers with the same link-local address on different interfaces
+can have their own neighbor-sets. An entry without a zone matches the address
+on every interface.
+
 ##### Examples
 
 - example 1
