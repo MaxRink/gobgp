@@ -344,3 +344,31 @@ func TestAdminStateLatestRequestWins(t *testing.T) {
 		})
 	}
 }
+
+// DisablePeer and EnablePeer of a peer that already waits a backed-off idle
+// hold time in Idle start it again after 1 s, like "neighbor shutdown" and
+// "no neighbor shutdown" in FRR, which sets v_start to 1 (bgpd.c:4941 of
+// FRR 10.2.1).
+func TestAdminDownInIdleSetsBackoffBack(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.Timers.Config.IdleHoldTimeAfterReset = 1
+	})
+	ctx := context.Background()
+	m1 := establishSession(t, s, peer, asn, peerAddr)
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	m1.PushBgpMessage(bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil)) // 2 s
+	w.Wait(t, 10*time.Second)
+	require.NoError(t, s.DisablePeer(ctx, &api.DisablePeerRequest{Address: peerAddr}))
+	time.Sleep(200 * time.Millisecond)
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+	start := time.Now()
+	require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
+	w.Wait(t, 10*time.Second)
+	took := time.Since(start)
+	t.Logf("Active %v after EnablePeer", took)
+	require.Less(t, took, 1500*time.Millisecond, "admin down in Idle kept the backed-off idle hold time")
+}

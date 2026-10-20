@@ -1174,6 +1174,11 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 					// stop idle hold timer
 					idleHoldTimer.Stop()
 					idleHoldDeadline = time.Time{}
+					// As for a session that ends with an administrative
+					// shutdown: the next start waits 1 s, like "no
+					// neighbor shutdown" in FRR (bgpd.c:4941 of FRR
+					// 10.2.1 sets v_start to 1).
+					fsm.idleHoldTime, fsm.idleHoldBackoff = idleHoldTimeInitial, idleHoldTimeInitial
 
 				case adminStateUp:
 					// restart idle hold timer
