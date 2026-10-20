@@ -6652,7 +6652,8 @@ func TestFirstConnectAtOnce(t *testing.T) {
 			if tt.now {
 				require.Less(t, time.Since(begin), time.Second, "the first connect waited for the retry delay")
 			} else {
-				require.GreaterOrEqual(t, time.Since(begin), time.Second, "the first connect did not wait")
+				// 0.75 to 1 times minConnectRetryInterval (2 s)
+				require.GreaterOrEqual(t, time.Since(begin), 1400*time.Millisecond, "the first connect did not wait 1.5 to 2 s")
 			}
 		})
 	}
