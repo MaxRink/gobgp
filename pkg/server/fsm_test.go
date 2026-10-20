@@ -1969,41 +1969,89 @@ func TestCapabilitiesExtendedNexthopIPv4Only(t *testing.T) {
 	}
 }
 
+// nextIdleHoldTime follows v_start, the start timer of FRR 10.2.1, which
+// the legacy ramdisk runs (10.3 has the same rules). Line numbers are
+// those of FRR 10.2.1:
+//
+//   - bgp_stop_with_error doubles v_start, up to 120 s (bgp_fsm.c:1579-1583):
+//     a NOTIFICATION received in OpenConfirm or Established (FSM table,
+//     Receive_NOTIFICATION_message).
+//   - bgp_write_notify doubles v_start for every NOTIFICATION that it
+//     writes (bgp_packet.c:775-779), before the BGP_Stop event.
+//   - bgp_stop_with_notify writes its NOTIFICATION and then sets v_start
+//     to 1 (bgp_fsm.c:1616): hold timer expiry (bgp_fsm_holdtime_expire,
+//     bgp_fsm.c:1988-2007) and the FSM Error for an unexpected message in
+//     OpenSent, a NOTIFICATION included (bgp_fsm_event_error,
+//     bgp_fsm.c:1973-1982).
+//   - bgp_stop keeps v_start: TCP closed or failed, bgp_fsm_exception
+//     (bgp_fsm.c:2373, an unexpected message in OpenConfirm, no
+//     NOTIFICATION), graceful restart.
+//   - peer_clear (clear bgp) sets v_start to 1 and then writes Cease/
+//     Administrative Reset, so 2 (bgpd.c:8433); without a session it
+//     stays 1. BFD Down writes Cease/BFD Down (bgp_bfd.c:56-63): doubled.
+//   - no neighbor shutdown sets v_start to 1 (bgpd.c:4941).
+//
+// A reset (ResetPeer) waits IdleHoldTimeAfterReset in GoBGP instead of
+// v_start; the backoff after it is the v_start of FRR.
 func TestNextIdleHoldTime(t *testing.T) {
-	cease := func(subcode uint8) *bgp.BGPNotification {
-		return &bgp.BGPNotification{ErrorCode: bgp.BGP_ERROR_CEASE, ErrorSubcode: subcode}
+	notif := func(code, subcode uint8) *bgp.BGPNotification {
+		return &bgp.BGPNotification{ErrorCode: code, ErrorSubcode: subcode}
 	}
-	holdTimerExpired := &bgp.BGPNotification{ErrorCode: bgp.BGP_ERROR_HOLD_TIMER_EXPIRED}
-
-	const afterReset = 30
+	cease := func(subcode uint8) *bgp.BGPNotification { return notif(bgp.BGP_ERROR_CEASE, subcode) }
+	const (
+		afterReset  = 30
+		opensent    = bgp.BGP_FSM_OPENSENT
+		openconfirm = bgp.BGP_FSM_OPENCONFIRM
+		established = bgp.BGP_FSM_ESTABLISHED
+	)
 
 	tests := []struct {
-		name        string
-		backoff     float64
-		reason      *fsmStateReason
-		wantHold    float64
-		wantBackoff float64
+		name         string
+		backoff      float64
+		from         bgp.FSMState
+		reason       *fsmStateReason
+		bfdDownReset bool
+		wantHold     float64
+		wantBackoff  float64
 	}{
-		{"notification sent doubles", 1, newfsmStateReason(fsmNotificationSent, cease(bgp.BGP_ERROR_SUB_BFD_DOWN), nil), 2, 2},
-		{"notification received doubles", 2, newfsmStateReason(fsmNotificationRecv, cease(bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET), nil), 4, 4},
-		{"hard reset received doubles", 1, newfsmStateReason(fsmHardReset, cease(bgp.BGP_ERROR_SUB_HARD_RESET), nil), 2, 2},
-		{"hold timer expired doubles", 4, newfsmStateReason(fsmHoldTimerExpired, holdTimerExpired, nil), 8, 8},
-		{"invalid message doubles", 8, newfsmStateReason(fsmInvalidMsg, nil, nil), 16, 16},
-		{"bad peer AS doubles", 16, newfsmStateReason(fsmBadPeerAS, nil, nil), 32, 32},
-		{"doubling stops at the maximum", 64, newfsmStateReason(fsmNotificationRecv, cease(bgp.BGP_ERROR_SUB_ADMINISTRATIVE_SHUTDOWN), nil), idleHoldTimeMax, idleHoldTimeMax},
-		{"maximum stays", idleHoldTimeMax, newfsmStateReason(fsmNotificationSent, holdTimerExpired, nil), idleHoldTimeMax, idleHoldTimeMax},
-		{"reset uses idle-hold-time-after-reset", 16, newfsmStateReason(fsmNotificationSent, cease(bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET), nil), afterReset, idleHoldTimeInitial},
-		{"admin down goes back to the initial value", 16, newfsmStateReason(fsmAdminDown, nil, nil), idleHoldTimeInitial, idleHoldTimeInitial},
-		{"read failure keeps the value", 4, newfsmStateReason(fsmReadFailed, nil, nil), 4, 4},
-		{"write failure keeps the value", 4, newfsmStateReason(fsmWriteFailed, nil, nil), 4, 4},
-		{"graceful restart keeps the value", 4, newfsmStateReason(fsmGracefulRestart, nil, nil), 4, 4},
-		{"restart timer expiry keeps the value", 4, newfsmStateReason(fsmRestartTimerExpired, nil, nil), 4, 4},
+		// bgp_stop_with_error (bgp_fsm.c:1579-1583)
+		{"notification received in established doubles", 1, established, newfsmStateReason(fsmNotificationRecv, cease(bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET), nil), false, 2, 2},
+		{"notification received in openconfirm doubles", 2, openconfirm, newfsmStateReason(fsmNotificationRecv, cease(bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION), nil), false, 4, 4},
+		{"hard reset received doubles", 1, established, newfsmStateReason(fsmHardReset, cease(bgp.BGP_ERROR_SUB_HARD_RESET), nil), false, 2, 2},
+		{"doubling stops at 120 s", 64, established, newfsmStateReason(fsmNotificationRecv, cease(bgp.BGP_ERROR_SUB_ADMINISTRATIVE_SHUTDOWN), nil), false, idleHoldTimeMax, idleHoldTimeMax},
+		// bgp_fsm_event_error, bgp_stop_with_notify (bgp_fsm.c:1973-1982, 1616)
+		{"notification received in opensent goes back to 1 s", 16, opensent, newfsmStateReason(fsmNotificationRecv, cease(bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION), nil), false, 1, 1},
+		{"version error received in opensent goes back to 1 s", 16, opensent, newfsmStateReason(fsmNotificationRecv, notif(bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_UNSUPPORTED_VERSION_NUMBER), nil), false, 1, 1},
+		{"unexpected message in opensent goes back to 1 s", 16, opensent, newfsmStateReason(fsmInvalidMsg, notif(bgp.BGP_ERROR_FSM_ERROR, 1), nil), false, 1, 1},
+		// bgp_fsm_holdtime_expire, bgp_stop_with_notify (bgp_fsm.c:1988-2007, 1616)
+		{"hold timer expiry goes back to 1 s", 16, established, newfsmStateReason(fsmHoldTimerExpired, notif(bgp.BGP_ERROR_HOLD_TIMER_EXPIRED, 0), nil), false, 1, 1},
+		{"hold timer expiry in opensent goes back to 1 s", 16, opensent, newfsmStateReason(fsmHoldTimerExpired, notif(bgp.BGP_ERROR_HOLD_TIMER_EXPIRED, 0), nil), false, 1, 1},
+		{"hold timer notification sent goes back to 1 s", 16, established, newfsmStateReason(fsmNotificationSent, notif(bgp.BGP_ERROR_HOLD_TIMER_EXPIRED, 0), nil), false, 1, 1},
+		// bgp_fsm_exception, bgp_stop: no NOTIFICATION (bgp_fsm.c:2373)
+		{"unexpected message in openconfirm keeps the value", 4, openconfirm, newfsmStateReason(fsmInvalidMsg, nil, nil), false, 4, 4},
+		// bgp_notify_send, bgp_write_notify (bgp_packet.c:775-779), then bgp_stop
+		{"message error sent doubles", 4, established, newfsmStateReason(fsmInvalidMsg, notif(bgp.BGP_ERROR_UPDATE_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_MALFORMED_ATTRIBUTE_LIST), nil), false, 8, 8},
+		{"open error sent doubles", 4, opensent, newfsmStateReason(fsmInvalidMsg, notif(bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_UNSUPPORTED_OPTIONAL_PARAMETER), nil), false, 8, 8},
+		{"bad peer AS doubles", 4, opensent, newfsmStateReason(fsmBadPeerAS, notif(bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_BAD_PEER_AS), nil), false, 8, 8},
+		{"native BFD down doubles (bgp_bfd.c:56-63)", 1, established, newfsmStateReason(fsmNotificationSent, cease(bgp.BGP_ERROR_SUB_BFD_DOWN), nil), false, 2, 2},
+		{"other notification sent doubles", 2, established, newfsmStateReason(fsmNotificationSent, cease(bgp.BGP_ERROR_SUB_MAXIMUM_NUMBER_OF_PREFIXES_REACHED), nil), false, 4, 4},
+		// resets: IdleHoldTimeAfterReset, backoff as v_start of FRR
+		{"reset: clear bgp sets 1 s, the notification doubles it (bgpd.c:8433)", 16, established, newfsmStateReason(fsmNotificationSent, cease(bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET), nil), false, afterReset, 2},
+		{"reset with bfd_down doubles (bgp_bfd.c:56-63)", 1, established, newfsmStateReason(fsmNotificationSent, cease(bgp.BGP_ERROR_SUB_BFD_DOWN), nil), true, afterReset, 2},
+		{"reset with bfd_down doubles a backed-off value", 4, established, newfsmStateReason(fsmNotificationSent, cease(bgp.BGP_ERROR_SUB_BFD_DOWN), nil), true, afterReset, 8},
+		// no neighbor shutdown (bgpd.c:4941)
+		{"admin down goes back to 1 s", 16, established, newfsmStateReason(fsmAdminDown, nil, nil), false, 1, 1},
+		// bgp_stop keeps v_start
+		{"read failure keeps the value", 4, established, newfsmStateReason(fsmReadFailed, nil, nil), false, 4, 4},
+		{"write failure keeps the value", 4, opensent, newfsmStateReason(fsmWriteFailed, nil, nil), false, 4, 4},
+		{"graceful restart keeps the value", 4, established, newfsmStateReason(fsmGracefulRestart, nil, nil), false, 4, 4},
+		{"restart timer expiry keeps the value", 4, bgp.BGP_FSM_ACTIVE, newfsmStateReason(fsmRestartTimerExpired, nil, nil), false, 4, 4},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hold, backoff := nextIdleHoldTime(tt.backoff, afterReset, tt.reason)
-			assert.Equal(t, tt.wantHold, hold)
-			assert.Equal(t, tt.wantBackoff, backoff)
+			hold, backoff := nextIdleHoldTime(tt.backoff, afterReset, tt.from, tt.reason, tt.bfdDownReset)
+			assert.Equal(t, tt.wantHold, hold, "idle hold time")
+			assert.Equal(t, tt.wantBackoff, backoff, "backoff")
 		})
 	}
 }

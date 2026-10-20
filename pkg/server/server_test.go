@@ -5820,7 +5820,8 @@ func TestResetPeerShortensRunningIdleHoldTimer(t *testing.T) {
 			notification := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil)
 
 			// A NOTIFICATION from the peer ends the session (idle hold
-			// time 2 s), another one ends the next connection (4 s).
+			// time 2 s), another one in OpenConfirm ends the next
+			// connection (4 s, FRR bgp_stop_with_error).
 			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
 			m.PushBgpMessage(notification)
 			w.Wait(t, 10*time.Second)
@@ -5829,9 +5830,15 @@ func TestResetPeerShortensRunningIdleHoldTimer(t *testing.T) {
 			m2 := NewMockConnection()
 			m2.SetRemoteAddr(peerAddr)
 			t.Cleanup(func() { m2.Close() })
-			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_OPENCONFIRM)
 			peer.fsm.connCh <- m2
-			m2.PushBgpMessage(notification)
+			open, err := bgp.NewBGPOpenMessage(uint16(asn), 90, netip.MustParseAddr(peerAddr),
+				[]bgp.OptionParameterInterface{bgp.NewOptionParameterCapability([]bgp.ParameterCapabilityInterface{bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC)})})
+			require.NoError(t, err)
+			go m2.PushBgpMessage(open)
+			w.Wait(t, 10*time.Second)
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			go m2.PushBgpMessage(notification)
 			w.Wait(t, 10*time.Second)
 
 			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)

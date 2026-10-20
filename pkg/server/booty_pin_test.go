@@ -230,3 +230,58 @@ func TestBfdDownResetTwiceAppliesIdleHoldTimeAfterReset(t *testing.T) {
 	}, false))
 	require.Equal(t, 3.0, hold, "IdleHoldTimeAfterReset not applied after two bfd_down resets")
 }
+
+// A ResetPeer of a peer without a session sets the backoff back to 1 s,
+// like peer_clear of FRR without a session (bgpd.c:8433 of FRR 10.2.1:
+// v_start = 1, no NOTIFICATION to double it). Two NOTIFICATIONs, one in
+// Established and one in OpenConfirm, back the idle hold time off to 4 s;
+// after the reset in Idle, a connection that fails in OpenSent (which
+// keeps the backoff) is followed by 1 s in Idle, not 4 s.
+func TestResetInIdleSetsBackoffBack(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.Timers.Config.IdleHoldTimeAfterReset = 1
+	})
+	ctx := context.Background()
+	notification := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil)
+	newConn := func() *MockConnection {
+		m := NewMockConnection()
+		m.SetRemoteAddr(peerAddr)
+		t.Cleanup(func() { m.Close() })
+		return m
+	}
+
+	m1 := establishSession(t, s, peer, asn, peerAddr)
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	m1.PushBgpMessage(notification) // Established: 2 s
+	w.Wait(t, 10*time.Second)
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+
+	m2 := newConn()
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_OPENCONFIRM)
+	peer.fsm.connCh <- m2
+	open, err := bgp.NewBGPOpenMessage(uint16(asn), 90, netip.MustParseAddr(peerAddr),
+		[]bgp.OptionParameterInterface{bgp.NewOptionParameterCapability([]bgp.ParameterCapabilityInterface{bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC)})})
+	require.NoError(t, err)
+	go m2.PushBgpMessage(open)
+	w.Wait(t, 10*time.Second)
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	go m2.PushBgpMessage(notification) // OpenConfirm: 4 s
+	w.Wait(t, 10*time.Second)
+
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+	require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr}))
+	w.Wait(t, 10*time.Second)
+
+	m3 := newConn()
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	peer.fsm.connCh <- m3
+	m3.remote.Close() // fails in OpenSent: the backoff stays
+	w.Wait(t, 10*time.Second)
+	idle := time.Now()
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+	require.Less(t, time.Since(idle), 2500*time.Millisecond, "the reset in Idle kept the backed-off idle hold time")
+}
