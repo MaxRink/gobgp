@@ -285,3 +285,62 @@ func TestResetInIdleSetsBackoffBack(t *testing.T) {
 	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
 	require.Less(t, time.Since(idle), 2500*time.Millisecond, "the reset in Idle kept the backed-off idle hold time")
 }
+
+// A request for the admin state that the peer already has changes
+// nothing: State.AdminDown stays false, and a running idle hold timer is
+// not started again.
+func TestEnablePeerOfEnabledPeerChangesNothing(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr)
+	ctx := context.Background()
+
+	require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
+	require.Never(t, func() bool { return peer.fsm.pConf.ReadOnly().State.AdminDown }, 500*time.Millisecond, 10*time.Millisecond,
+		"EnablePeer of an enabled peer set State.AdminDown")
+
+	// A NOTIFICATION in Established: 2 s in Idle. EnablePeer 1.5 s into
+	// it must not start the 2 s again.
+	m := establishSession(t, s, peer, asn, peerAddr)
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	m.PushBgpMessage(bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil))
+	w.Wait(t, 10*time.Second)
+	idle := time.Now()
+	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+	time.Sleep(1500 * time.Millisecond)
+	require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
+	w.Wait(t, 10*time.Second)
+	require.Less(t, time.Since(idle), 2800*time.Millisecond, "EnablePeer of an enabled peer started the idle hold timer again")
+	require.False(t, peer.fsm.pConf.ReadOnly().State.AdminDown)
+}
+
+// The latest admin state request wins, also when the FSM has not taken the
+// one before it yet: DisablePeer and EnablePeer in a row leave the request
+// to go up, and down, up, down the request to go down. Before, a request
+// was dropped while another one was queued. No FSM runs here, so nothing
+// takes the queued request.
+func TestAdminStateLatestRequestWins(t *testing.T) {
+	addr := netip.MustParseAddr("10.0.0.1")
+	for _, tt := range []struct {
+		name   string
+		states []adminState
+		want   adminState
+	}{
+		{"down up", []adminState{adminStateDown, adminStateUp}, adminStateUp},
+		{"down up down", []adminState{adminStateDown, adminStateUp, adminStateDown}, adminStateDown},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewBgpServer()
+			p, h := makePeerAndHandler(NewMockConnection())
+			t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+			s.neighborMap[addr] = p
+			for _, st := range tt.states {
+				require.NoError(t, s.setAdminState(addr.String(), "", st))
+			}
+			require.Len(t, p.fsm.adminStateCh, 1)
+			require.Equal(t, tt.want, (<-p.fsm.adminStateCh).State)
+		})
+	}
+}

@@ -4662,13 +4662,19 @@ func (s *BgpServer) setAdminState(addr, communication string, state adminState) 
 		return err
 	}
 	for _, peer := range peers {
+		// The latest request wins: one that the FSM has not taken yet is
+		// replaced, so that down, up, down cannot end up. Only the server
+		// goroutine sends on adminStateCh, so the send after the drain
+		// does not block.
 		f := func(stateOp *adminStateOperation, message string) {
 			select {
-			case peer.fsm.adminStateCh <- *stateOp:
-				peer.fsm.logger.Debug("set admin state", slog.String("Message", message))
+			case old := <-peer.fsm.adminStateCh:
+				peer.fsm.logger.Info("replaced an admin state request that was not taken yet",
+					slog.String("Replaced", old.State.String()), slog.String("By", stateOp.State.String()))
 			default:
-				peer.fsm.logger.Warn("previous setting admin state request is still remaining")
 			}
+			peer.fsm.adminStateCh <- *stateOp
+			peer.fsm.logger.Debug("set admin state", slog.String("Message", message))
 		}
 		switch state {
 		case adminStateUp:
