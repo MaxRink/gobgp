@@ -4808,6 +4808,12 @@ func TestNeighborConditionZone(t *testing.T) {
 		assert.False(t, c.Evaluate(eth0, exportTo("fe80::1%eth1")), entry)
 	}
 
+	// The zone is an interface name and compares exactly: Linux interface
+	// names are case-sensitive, and an index ("%2") is another string.
+	for _, entry := range []string{"fe80::1%ETH0/128", "fe80::1%Eth0/128", "fe80::1%2/128"} {
+		assert.False(t, cond(entry).Evaluate(eth0, nil), entry)
+	}
+
 	// No zone: matches every zone and the unzoned address, as before.
 	for _, entry := range []string{"fe80::1/128", "fe80::1"} {
 		c := cond(entry)
