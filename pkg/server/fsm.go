@@ -944,6 +944,21 @@ func isVersionError(n *bgp.BGPNotification) bool {
 	return n.ErrorCode == bgp.BGP_ERROR_OPEN_MESSAGE_ERROR && n.ErrorSubcode == bgp.BGP_ERROR_SUB_UNSUPPORTED_VERSION_NUMBER
 }
 
+// receivedGracefulRestartTuples reports whether the peer sent at least one
+// AFI/SAFI tuple in its graceful restart capability. RFC 4724 Section 5
+// (Events 16 and 17) treats a new connection while Established as a
+// restart only for such a peer; FRR likewise (bgp_accept acts only with
+// PEER_STATUS_NSF_MODE, which is set only for a family with
+// PEER_CAP_RESTART_AF_RCV).
+func receivedGracefulRestartTuples(conf *oc.Neighbor) bool {
+	for _, a := range conf.AfiSafis {
+		if a.MpGracefulRestart.State.Received {
+			return true
+		}
+	}
+	return false
+}
+
 // takeBfdDownReset reports whether m, taken from fsm.notification, is the
 // Cease/BFD Down of a ResetPeer with bfd_down.
 func (fsm *fsm) takeBfdDownReset(m *bgp.BGPMessage) bool {
@@ -2469,12 +2484,15 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 				break
 			}
 			conf := fsm.pConf.ReadOnly()
-			if conf.GracefulRestart.State.Enabled {
+			if conf.GracefulRestart.State.Enabled && receivedGracefulRestartTuples(conf) {
 				// RFC 4724 Section 4.2: a new connection from a peer
 				// that negotiated graceful restart means that the peer
 				// restarted. Close the old session as if its TCP
 				// connection had failed, keep the peer's routes as
-				// stale, and take the new connection in Active.
+				// stale, and take the new connection in Active. Only
+				// for a peer that sent AFI/SAFI tuples: a helper-only
+				// peer preserves no forwarding state, and its new
+				// connection is a collision (RFC 4271 Section 6.8).
 				fsm.conn.Close()
 				h.outgoing.In() <- *newfsmStateReason(fsmGracefulRestart, nil, nil)
 				fsm.logger.Info("peer graceful restart: new connection while established", slog.String("State", fsm.state.String()))

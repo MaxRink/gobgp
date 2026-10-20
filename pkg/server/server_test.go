@@ -6111,6 +6111,48 @@ func TestNewConnectionFromRestartingPeer(t *testing.T) {
 		"stale routes not removed at End-of-RIB: %v", adjIn())
 }
 
+// A peer that sends the graceful restart capability without AFI/SAFI
+// tuples (a helper-only peer, for example FRR without "bgp graceful-restart")
+// does not preserve its forwarding state. A new connection from it while
+// the session is Established is a connection collision (RFC 4271 Section
+// 6.8): the new connection is closed and the session stays up. RFC 4724
+// Section 5 handles it as a restart only for a peer that sent tuples, and
+// FRR does the same (bgp_accept acts only with PEER_STATUS_NSF_MODE, which
+// is set only for a family with PEER_CAP_RESTART_AF_RCV).
+func TestNewConnectionFromHelperOnlyPeerIsCollision(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.GracefulRestart.Config.Enabled = true
+		n.GracefulRestart.Config.HelperOnly = true
+		n.GracefulRestart.Config.RestartTime = 120
+		n.AfiSafis[0].MpGracefulRestart.Config.Enabled = true
+	})
+	helperOnly := []bgp.ParameterCapabilityInterface{
+		bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC),
+		bgp.NewCapGracefulRestart(false, false, 120, nil),
+	}
+
+	m1 := NewMockConnection()
+	m1.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m1.Close() })
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+	peer.fsm.connCh <- m1
+	pushOpen(t, m1, asn, peerAddr, helperOnly...)
+	w.Wait(t, 10*time.Second)
+
+	m2 := NewMockConnection()
+	m2.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m2.Close() })
+	peer.PassConn(m2)
+	require.Never(t, func() bool {
+		return peer.State() != bgp.BGP_FSM_ESTABLISHED
+	}, 2*time.Second, 10*time.Millisecond, "the session ended for a new connection of a helper-only peer")
+	require.Empty(t, m2.GetSentMessages(), "the new connection is closed without a message")
+}
+
 // global.afi-safis no longer selects the Loc-RIB tables. A family left out of
 // it used to have no table, and TableManager.Update drops a path whose family
 // has no table, so the route went nowhere without an error.
