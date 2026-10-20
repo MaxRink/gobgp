@@ -233,57 +233,72 @@ func TestBfdDownResetTwiceAppliesIdleHoldTimeAfterReset(t *testing.T) {
 
 // A ResetPeer of a peer without a session sets the backoff back to 1 s,
 // like peer_clear of FRR without a session (bgpd.c:8433 of FRR 10.2.1:
-// v_start = 1, no NOTIFICATION to double it). Two NOTIFICATIONs, one in
-// Established and one in OpenConfirm, back the idle hold time off to 4 s;
-// after the reset in Idle, a connection that fails in OpenSent (which
-// keeps the backoff) is followed by 1 s in Idle, not 4 s.
+// v_start = 1, no NOTIFICATION to double it). A ResetPeer with bfd_down
+// keeps it, like a BFD Down in FRR without a session, which only stops the
+// peer (bgp_bfd.c:56-63, bgp_stop). Two NOTIFICATIONs, one in Established
+// and one in OpenConfirm, back the idle hold time off to 4 s; after the
+// reset in Idle, a connection that fails in OpenSent (which keeps the
+// backoff) is followed by the backoff in Idle.
 func TestResetInIdleSetsBackoffBack(t *testing.T) {
 	const (
 		asn      = 65001
 		peerAddr = "10.0.0.1"
 	)
-	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
-		n.Timers.Config.IdleHoldTimeAfterReset = 1
-	})
-	ctx := context.Background()
-	notification := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil)
-	newConn := func() *MockConnection {
-		m := NewMockConnection()
-		m.SetRemoteAddr(peerAddr)
-		t.Cleanup(func() { m.Close() })
-		return m
+	for _, tt := range []struct {
+		name     string
+		req      *api.ResetPeerRequest
+		min, max time.Duration
+	}{
+		{"administrative reset: 1 s", &api.ResetPeerRequest{Address: peerAddr}, 0, 2500 * time.Millisecond},
+		{"bfd down: 4 s kept", &api.ResetPeerRequest{Address: peerAddr, BfdDown: true}, 3 * time.Second, 6 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = 1
+			})
+			ctx := context.Background()
+			notification := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil)
+			newConn := func() *MockConnection {
+				m := NewMockConnection()
+				m.SetRemoteAddr(peerAddr)
+				t.Cleanup(func() { m.Close() })
+				return m
+			}
+
+			m1 := establishSession(t, s, peer, asn, peerAddr)
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			m1.PushBgpMessage(notification) // Established: 2 s
+			w.Wait(t, 10*time.Second)
+			waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+
+			m2 := newConn()
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_OPENCONFIRM)
+			peer.fsm.connCh <- m2
+			open, err := bgp.NewBGPOpenMessage(uint16(asn), 90, netip.MustParseAddr(peerAddr),
+				[]bgp.OptionParameterInterface{bgp.NewOptionParameterCapability([]bgp.ParameterCapabilityInterface{bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC)})})
+			require.NoError(t, err)
+			go m2.PushBgpMessage(open)
+			w.Wait(t, 10*time.Second)
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			go m2.PushBgpMessage(notification) // OpenConfirm: 4 s
+			w.Wait(t, 10*time.Second)
+
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+			require.NoError(t, s.ResetPeer(ctx, tt.req))
+			w.Wait(t, 10*time.Second)
+
+			m3 := newConn()
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			peer.fsm.connCh <- m3
+			m3.remote.Close() // fails in OpenSent: the backoff stays
+			w.Wait(t, 10*time.Second)
+			idle := time.Now()
+			waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+			took := time.Since(idle)
+			require.Less(t, took, tt.max)
+			require.GreaterOrEqual(t, took, tt.min)
+		})
 	}
-
-	m1 := establishSession(t, s, peer, asn, peerAddr)
-	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
-	m1.PushBgpMessage(notification) // Established: 2 s
-	w.Wait(t, 10*time.Second)
-	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
-
-	m2 := newConn()
-	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_OPENCONFIRM)
-	peer.fsm.connCh <- m2
-	open, err := bgp.NewBGPOpenMessage(uint16(asn), 90, netip.MustParseAddr(peerAddr),
-		[]bgp.OptionParameterInterface{bgp.NewOptionParameterCapability([]bgp.ParameterCapabilityInterface{bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC)})})
-	require.NoError(t, err)
-	go m2.PushBgpMessage(open)
-	w.Wait(t, 10*time.Second)
-	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
-	go m2.PushBgpMessage(notification) // OpenConfirm: 4 s
-	w.Wait(t, 10*time.Second)
-
-	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
-	require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr}))
-	w.Wait(t, 10*time.Second)
-
-	m3 := newConn()
-	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
-	peer.fsm.connCh <- m3
-	m3.remote.Close() // fails in OpenSent: the backoff stays
-	w.Wait(t, 10*time.Second)
-	idle := time.Now()
-	waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
-	require.Less(t, time.Since(idle), 2500*time.Millisecond, "the reset in Idle kept the backed-off idle hold time")
 }
 
 // A request for the admin state that the peer already has changes
@@ -371,4 +386,17 @@ func TestAdminDownInIdleSetsBackoffBack(t *testing.T) {
 	took := time.Since(start)
 	t.Logf("Active %v after EnablePeer", took)
 	require.Less(t, took, 1500*time.Millisecond, "admin down in Idle kept the backed-off idle hold time")
+}
+
+// The prefix limit shutdown and then DisablePeer: State.AdminDown stays
+// set. It was toggled before, so it went back to false here.
+func TestAdminDownAfterPrefixLimitKeepsAdminDown(t *testing.T) {
+	p, h := makePeerAndHandler(NewMockConnection())
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	require.NoError(t, h.changeadminState(adminStatePfxCt))
+	require.True(t, p.fsm.pConf.ReadOnly().State.AdminDown)
+	require.NoError(t, h.changeadminState(adminStateDown))
+	require.True(t, p.fsm.pConf.ReadOnly().State.AdminDown)
+	require.NoError(t, h.changeadminState(adminStateUp))
+	require.False(t, p.fsm.pConf.ReadOnly().State.AdminDown)
 }
