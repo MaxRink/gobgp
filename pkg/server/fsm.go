@@ -474,13 +474,17 @@ type fsm struct {
 	extendedMessage atomic.Bool
 
 	// safe for concurrent access
-	state                    fsmState
-	familyMap                atomic.Value // map[bgp.Family]bgp.BGPAddPathMode
-	rtcEORWait               atomic.Bool
-	logger                   *slog.Logger
-	gracefulRestartTimer     *time.Timer
-	outgoingCh               *channels.InfiniteChannel
-	notification             chan *bgp.BGPMessage
+	state                fsmState
+	familyMap            atomic.Value // map[bgp.Family]bgp.BGPAddPathMode
+	rtcEORWait           atomic.Bool
+	logger               *slog.Logger
+	gracefulRestartTimer *time.Timer
+	outgoingCh           *channels.InfiniteChannel
+	notification         chan *bgp.BGPMessage
+	// bfdDownReset is the Cease/BFD Down that ResetPeer with bfd_down put
+	// on notification. It is a reset, so IdleHoldTimeAfterReset applies,
+	// unlike for the Cease/BFD Down of the native BFD.
+	bfdDownReset             atomic.Pointer[bgp.BGPMessage]
 	deconfiguredNotification chan *bgp.BGPMessage
 	connCh                   chan net.Conn
 	adminState               adminStateRaw
@@ -907,6 +911,10 @@ type fsmHandler struct {
 	// collision are gone; loop() then caps the next idle hold time at
 	// IdleHoldTimeAfterReset.
 	collisionLost bool
+	// bfdDownReset is set by established when it sent the Cease/BFD Down of
+	// a ResetPeer with bfd_down; loop() then applies
+	// IdleHoldTimeAfterReset, as for Cease/Administrative Reset.
+	bfdDownReset bool
 }
 
 // loserAnswer is the NOTIFICATION that the losing connection of a collision
@@ -934,6 +942,23 @@ func loserAnswer(e *fsmMsg) *bgp.BGPMessage {
 // (RFC 4271 Section 8.1.2, Event 24), which gets no answer.
 func isVersionError(n *bgp.BGPNotification) bool {
 	return n.ErrorCode == bgp.BGP_ERROR_OPEN_MESSAGE_ERROR && n.ErrorSubcode == bgp.BGP_ERROR_SUB_UNSUPPORTED_VERSION_NUMBER
+}
+
+// takeBfdDownReset reports whether m, taken from fsm.notification, is the
+// Cease/BFD Down of a ResetPeer with bfd_down.
+func (fsm *fsm) takeBfdDownReset(m *bgp.BGPMessage) bool {
+	return m != nil && fsm.bfdDownReset.CompareAndSwap(m, nil)
+}
+
+// isReset reports whether m, taken from fsm.notification, is a reset from
+// ResetPeer: Cease/Administrative Reset, or Cease/BFD Down with bfd_down.
+// Both apply IdleHoldTimeAfterReset.
+func (fsm *fsm) isReset(m *bgp.BGPMessage) bool {
+	if fsm.takeBfdDownReset(m) {
+		return true
+	}
+	b := notificationBody(m)
+	return b != nil && b.ErrorCode == bgp.BGP_ERROR_CEASE && b.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET
 }
 
 // sendLoserNotification sends m on conn, the losing connection of a
@@ -1053,7 +1078,7 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 			// after reset, as it does after a reset of a session (as in
 			// v3). An administratively down peer starts with it when it
 			// is enabled.
-			if b := notificationBody(m); b != nil && b.ErrorCode == bgp.BGP_ERROR_CEASE && b.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET {
+			if fsm.isReset(m) {
 				fsm.idleHoldTime = fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset
 				// A peer that is enabled already waits the idle hold
 				// time, for example after an administrative shutdown and
@@ -2435,6 +2460,7 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			}
 			return -1, newfsmStateReason(fsmDeConfigured, notificationBody(m), nil)
 		case m := <-fsm.notification:
+			h.bfdDownReset = fsm.takeBfdDownReset(m)
 			m = convertNotification(m)
 			_ = fsm.sendNotification(fsm.conn, m)
 			return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmNotificationSent, notificationBody(m), nil)
@@ -2582,6 +2608,9 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 		case bgp.BGP_FSM_IDLE:
 			conf := fsm.pConf.ReadOnly()
 			fsm.idleHoldTime, fsm.idleHoldBackoff = nextIdleHoldTime(fsm.idleHoldBackoff, conf.Timers.Config.IdleHoldTimeAfterReset, reason)
+			if h.bfdDownReset {
+				fsm.idleHoldTime, fsm.idleHoldBackoff = conf.Timers.Config.IdleHoldTimeAfterReset, idleHoldTimeInitial
+			}
 			if h.collisionLost {
 				fsm.idleHoldTime = min(fsm.idleHoldTime, conf.Timers.Config.IdleHoldTimeAfterReset)
 			}
@@ -2589,6 +2618,7 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 			fsm.idleHoldBackoff = idleHoldTimeInitial
 		}
 		h.collisionLost = false
+		h.bfdDownReset = false
 
 		h.fsm.stateChange(nextState, reason)
 

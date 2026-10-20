@@ -5707,33 +5707,90 @@ func TestResetPeerWhileDownDoesNotResetNextSession(t *testing.T) {
 }
 
 // A hard ResetPeer against a peer that is administratively down sets the
-// idle hold time after reset for its next start, as v3 did: after
-// EnablePeer the peer waits IdleHoldTimeAfterReset in Idle, not the fixed
-// holdtimeIdle (5 s).
+// idle hold time after reset for its next start, as v3 did and as a reset
+// of a session does: after EnablePeer the peer waits
+// IdleHoldTimeAfterReset (3 s here) in Idle, not the 1 s that an
+// administrative shutdown leaves. ResetPeer with bfd_down is a reset too.
 // https://github.com/osrg/gobgp/issues/3740
 func TestResetPeerWhileAdminDownAppliesIdleHoldTimeAfterReset(t *testing.T) {
 	const (
 		asn      = 65001
 		peerAddr = "10.0.0.1"
 	)
+	for _, tt := range []struct {
+		name string
+		req  *api.ResetPeerRequest
+	}{
+		{"administrative reset", &api.ResetPeerRequest{Address: peerAddr, Communication: "BFD is down"}},
+		{"bfd down", &api.ResetPeerRequest{Address: peerAddr, BfdDown: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = 3
+			})
+			ctx := context.Background()
+			establishSession(t, s, peer, asn, peerAddr)
 
-	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
-		n.Timers.Config.IdleHoldTimeAfterReset = 1
-	})
-	ctx := context.Background()
-	establishSession(t, s, peer, asn, peerAddr)
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			require.NoError(t, s.DisablePeer(ctx, &api.DisablePeerRequest{Address: peerAddr}))
+			w.Wait(t, 10*time.Second)
+			require.NoError(t, s.ResetPeer(ctx, tt.req))
+			require.Eventually(t, func() bool { return len(peer.fsm.notification) == 0 }, 5*time.Second, 10*time.Millisecond)
 
-	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
-	require.NoError(t, s.DisablePeer(ctx, &api.DisablePeerRequest{Address: peerAddr}))
-	w.Wait(t, 10*time.Second)
-	require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, Communication: "BFD is down"}))
-	require.Eventually(t, func() bool { return len(peer.fsm.notification) == 0 }, 5*time.Second, 10*time.Millisecond)
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+			start := time.Now()
+			require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
+			w.Wait(t, 10*time.Second)
+			took := time.Since(start)
+			require.Greater(t, took, 2500*time.Millisecond, "idle hold time after reset (3 s) not applied")
+			require.Less(t, took, 5*time.Second)
+		})
+	}
+}
 
-	w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
-	start := time.Now()
-	require.NoError(t, s.EnablePeer(ctx, &api.EnablePeerRequest{Address: peerAddr}))
-	w.Wait(t, 10*time.Second)
-	require.Less(t, time.Since(start), 3*time.Second, "idle hold time after reset (1 s) not applied")
+// ResetPeer with bfd_down sends Cease/BFD Down (RFC 9384) on an established
+// session and applies the idle hold time after reset like an
+// Administrative Reset. The Cease/BFD Down of the native BFD keeps the
+// backed-off idle hold time (2 s after a session).
+func TestResetPeerBfdDown(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	for _, tt := range []struct {
+		name     string
+		down     func(s *BgpServer) error
+		wantHold float64
+	}{
+		{"reset peer", func(s *BgpServer) error {
+			return s.ResetPeer(context.Background(), &api.ResetPeerRequest{Address: peerAddr, BfdDown: true})
+		}, 3},
+		{"native bfd", func(s *BgpServer) error {
+			return s.bfdDown(context.Background(), netip.MustParseAddr(peerAddr))
+		}, 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = 3
+			})
+			m := establishSession(t, s, peer, asn, peerAddr)
+
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			require.NoError(t, tt.down(s))
+			w.Wait(t, 10*time.Second)
+
+			require.Eventually(t, func() bool {
+				n := sentNotification(m)
+				return n != nil && n.ErrorCode == bgp.BGP_ERROR_CEASE && n.ErrorSubcode == bgp.BGP_ERROR_SUB_BFD_DOWN
+			}, 10*time.Second, 10*time.Millisecond)
+			var hold float64
+			require.NoError(t, s.mgmtOperation(func() error {
+				hold = peer.fsm.idleHoldTime
+				return nil
+			}, false))
+			require.Equal(t, tt.wantHold, hold)
+		})
+	}
 }
 
 // A reset that arrives while an enabled peer waits a backed-off idle hold
@@ -5780,7 +5837,7 @@ func TestResetPeerShortensRunningIdleHoldTimer(t *testing.T) {
 			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
 			time.Sleep(500 * time.Millisecond)
 			start := time.Now()
-			require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, Communication: "BFD is down"}))
+			require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, BfdDown: true}))
 			w.Wait(t, 40*time.Second)
 			took := time.Since(start)
 			require.Less(t, took, tt.max)

@@ -4614,8 +4614,33 @@ func (s *BgpServer) ResetPeer(ctx context.Context, r *api.ResetPeerRequest) erro
 			return err
 		}
 
+		if r.BfdDown {
+			return s.sendBfdDownReset(addr)
+		}
 		return s.sendNotification("Neighbor reset", addr, bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET, newAdministrativeCommunication(comm))
 	}, true)
+}
+
+// sendBfdDownReset is ResetPeer with bfd_down, for an application with its
+// own BFD: it sends Cease/BFD Down (RFC 9384) like bfdDown, but it is a
+// reset, so IdleHoldTimeAfterReset applies as for Cease/Administrative
+// Reset.
+func (s *BgpServer) sendBfdDownReset(addr string) error {
+	s.logger.Info("Send operation notification",
+		slog.String("Topic", "Operation"),
+		slog.String("Key", addr),
+		slog.String("Op", "Neighbor reset, BFD down"))
+
+	peers, err := s.addrToPeers(addr)
+	if err != nil {
+		return err
+	}
+	for _, peer := range peers {
+		m := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_BFD_DOWN, nil)
+		peer.fsm.bfdDownReset.Store(m)
+		peer.sendNotification(m)
+	}
+	return nil
 }
 
 // bfdDown implements peerState. RFC 9384 Section 3 says: "When a BGP

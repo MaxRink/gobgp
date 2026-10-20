@@ -7900,3 +7900,11 @@ func Test_DiscardedEVPNWithdrawIsNotEndOfRib(t *testing.T) {
 	require.True(t, eor)
 	require.Equal(t, RF_EVPN, family)
 }
+
+// Cease/BFD Down is not a Hard Reset (RFC 9384 Section 4 asks for one only
+// where RFC 8538 already does): the routes of a graceful restart peer that
+// sends it stay as stale.
+func TestCeaseBFDDownIsNotHardReset(t *testing.T) {
+	require.False(t, ShouldHardReset(BGP_ERROR_SUB_BFD_DOWN, false))
+	require.False(t, ShouldHardReset(BGP_ERROR_SUB_BFD_DOWN, true))
+}
