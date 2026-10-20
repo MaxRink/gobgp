@@ -1649,6 +1649,17 @@ func (fsm *fsm) handleOpen(fmsg *fsmMsg) (bgp.FSMState, *fsmStateReason, *bgp.BG
 			}
 		}
 		notif := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_FSM_ERROR, 1, nil)
+		if n, ok := m.Body.(*bgp.BGPNotification); ok {
+			// For example Cease/Connection Collision Resolution from a
+			// peer that keeps the other connection. RFC 4271 Section
+			// 8.2.2 (OpenSent, Event 25) still answers it with the FSM
+			// Error, as FRR does; the reason lets the caller go on with
+			// the other connection.
+			fsm.logger.Info("received notification in OpenSent",
+				slog.Int("Code", int(n.ErrorCode)),
+				slog.Int("Subcode", int(n.ErrorSubcode)))
+			return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmNotificationRecv, n, nil), notif
+		}
 		return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmInvalidMsg, notificationBody(notif), nil), notif
 	case *bgp.MessageError:
 		notif := bgp.NewBGPNotificationMessage(m.TypeCode, m.SubTypeCode, m.Data)
@@ -1707,6 +1718,10 @@ func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReaso
 					_ = fsm.sendNotification(fsm.conn, notif)
 				} else {
 					fsm.conn.Close()
+				}
+				if reason.Type == fsmNotificationRecv {
+					// The other connection may still come up.
+					return h.failedConn(reason)
 				}
 				return nextState, reason
 			}

@@ -222,7 +222,8 @@ func TestFSMHandlerOpensent_HoldTimerExpired(t *testing.T) {
 
 // RFC 4271 8.2.2: in OpenSent, a NOTIFICATION with a version error
 // (Event 24) gets no answer, and any other NOTIFICATION (Event 25) gets
-// a Finite State Machine Error.
+// a Finite State Machine Error. Both have the reason fsmNotificationRecv,
+// so that opensent() can go on with the other connection of a collision.
 func TestFSMHandlerOpensent_NotificationReceived(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -232,8 +233,8 @@ func TestFSMHandlerOpensent_NotificationReceived(t *testing.T) {
 		wantAnswer bool
 	}{
 		{"version error", bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_UNSUPPORTED_VERSION_NUMBER, fsmNotificationRecv, false},
-		{"other open error", bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_BAD_PEER_AS, fsmInvalidMsg, true},
-		{"cease", bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, fsmInvalidMsg, true},
+		{"other open error", bgp.BGP_ERROR_OPEN_MESSAGE_ERROR, bgp.BGP_ERROR_SUB_BAD_PEER_AS, fsmNotificationRecv, true},
+		{"cease", bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, fsmNotificationRecv, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
