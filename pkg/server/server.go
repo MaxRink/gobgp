@@ -2096,6 +2096,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 		// the established loop reads this channel, so a leftover would kill
 		// the next session right after it establishes.
 		drainChannel(peer.fsm.notification)
+		peer.fsm.bfdDownResets.Clear()
 
 		if nextState == bgp.BGP_FSM_ESTABLISHED {
 			conf := peer.fsm.pConf.ReadOnly()
@@ -4637,8 +4638,10 @@ func (s *BgpServer) sendBfdDownReset(addr string) error {
 	}
 	for _, peer := range peers {
 		m := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_BFD_DOWN, nil)
-		peer.fsm.bfdDownReset.Store(m)
-		peer.sendNotification(m)
+		peer.fsm.bfdDownResets.Store(m, struct{}{})
+		if !nonblockSendChannel(peer.fsm.notification, m) {
+			peer.fsm.bfdDownResets.Delete(m)
+		}
 	}
 	return nil
 }

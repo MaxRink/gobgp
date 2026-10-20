@@ -481,10 +481,12 @@ type fsm struct {
 	gracefulRestartTimer *time.Timer
 	outgoingCh           *channels.InfiniteChannel
 	notification         chan *bgp.BGPMessage
-	// bfdDownReset is the Cease/BFD Down that ResetPeer with bfd_down put
-	// on notification. It is a reset, so IdleHoldTimeAfterReset applies,
-	// unlike for the Cease/BFD Down of the native BFD.
-	bfdDownReset             atomic.Pointer[bgp.BGPMessage]
+	// bfdDownResets holds the Cease/BFD Down messages (*bgp.BGPMessage)
+	// that ResetPeer with bfd_down put on notification. They are resets,
+	// so IdleHoldTimeAfterReset applies, unlike for the Cease/BFD Down of
+	// the native BFD. A set, so that a second ResetPeer does not take the
+	// mark from the first one.
+	bfdDownResets            sync.Map
 	deconfiguredNotification chan *bgp.BGPMessage
 	connCh                   chan net.Conn
 	adminState               adminStateRaw
@@ -966,7 +968,11 @@ func (fsm *fsm) peerSentGracefulRestartTuples() bool {
 // takeBfdDownReset reports whether m, taken from fsm.notification, is the
 // Cease/BFD Down of a ResetPeer with bfd_down.
 func (fsm *fsm) takeBfdDownReset(m *bgp.BGPMessage) bool {
-	return m != nil && fsm.bfdDownReset.CompareAndSwap(m, nil)
+	if m == nil {
+		return false
+	}
+	_, ok := fsm.bfdDownResets.LoadAndDelete(m)
+	return ok
 }
 
 // isReset reports whether m, taken from fsm.notification, is a reset from

@@ -148,6 +148,7 @@ func TestAdminDownKeepsGracefulRestartRoutesUntilRestartTimer(t *testing.T) {
 		"the restart timer did not expire in Idle")
 	require.Greater(t, time.Since(start), 2500*time.Millisecond, "the stale routes went before the restart time (3 s)")
 }
+
 // The peer sent graceful restart tuples in session 1 and is helper-only in
 // session 2. A late second connection during session 2 is a collision:
 // RFC 4724 Section 5 looks at the capability of the current session, and
@@ -203,3 +204,29 @@ func TestNewConnectionAfterTuplesFromEarlierSessionIsCollision(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "a helper-only session 2 ended because session 1 sent GR tuples")
 }
 
+// Two ResetPeer calls with bfd_down before the FSM takes the first: the
+// second one is dropped by nonblockSendChannel, and the first one is still
+// a reset, so IdleHoldTimeAfterReset applies.
+func TestBfdDownResetTwiceAppliesIdleHoldTimeAfterReset(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+		n.Timers.Config.IdleHoldTimeAfterReset = 3
+	})
+	establishSession(t, s, peer, asn, peerAddr)
+
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	require.NoError(t, s.mgmtOperation(func() error {
+		_ = s.sendBfdDownReset(peerAddr)
+		return s.sendBfdDownReset(peerAddr)
+	}, false))
+	w.Wait(t, 10*time.Second)
+	var hold float64
+	require.NoError(t, s.mgmtOperation(func() error {
+		hold = peer.fsm.idleHoldTime
+		return nil
+	}, false))
+	require.Equal(t, 3.0, hold, "IdleHoldTimeAfterReset not applied after two bfd_down resets")
+}
