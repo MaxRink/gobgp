@@ -4666,24 +4666,25 @@ func (s *BgpServer) ResetPeer(ctx context.Context, r *api.ResetPeerRequest) erro
 			return err
 		}
 
-		return s.resetPeer(addr, newAdministrativeCommunication(comm))
+		return s.resetPeer(addr, peerReset{communication: newAdministrativeCommunication(comm), bfdDown: r.BfdDown})
 	}, true)
 }
 
 // resetPeer passes ResetPeer to the FSM of each peer. Unlike a NOTIFICATION
 // on fsm.notification, the FSM handles it in every state, like FRR
-// peer_clear(): it sends Cease/Administrative Reset if the session has a
-// connection, and the peer waits idle-hold-time-after-reset in Idle before
-// it connects again.
-func (s *BgpServer) resetPeer(addr string, communication []byte) error {
+// peer_clear(): it sends Cease/Administrative Reset (Cease/BFD Down with
+// bfd_down) if the session has a connection, and the peer waits
+// idle-hold-time-after-reset in Idle before it connects again.
+func (s *BgpServer) resetPeer(addr string, r peerReset) error {
 	s.logger.Info("Reset peer",
 		slog.String("Topic", "Operation"),
-		slog.String("Key", addr))
+		slog.String("Key", addr),
+		slog.Bool("BfdDown", r.bfdDown))
 
 	peers, err := s.addrToPeers(addr)
 	if err == nil {
 		for _, peer := range peers {
-			peer.reset(communication)
+			peer.reset(r)
 		}
 	}
 	return err

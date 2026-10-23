@@ -7299,3 +7299,108 @@ func TestAddDefinedSetNeighborZone(t *testing.T) {
 
 	assert.Error(t, s.AddDefinedSet(ctx, &api.AddDefinedSetRequest{DefinedSet: set("10.0.0.1%eth0/32")}))
 }
+
+// ResetPeer with bfd_down sends Cease/BFD Down (RFC 9384) on an established
+// session and applies the idle hold time after reset like an
+// Administrative Reset. The Cease/BFD Down of the native BFD keeps the
+// backed-off idle hold time (2 s after a session).
+func TestResetPeerBfdDown(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	for _, tt := range []struct {
+		name     string
+		down     func(s *BgpServer) error
+		wantHold float64
+	}{
+		{"reset peer", func(s *BgpServer) error {
+			return s.ResetPeer(context.Background(), &api.ResetPeerRequest{Address: peerAddr, BfdDown: true})
+		}, 3},
+		{"native bfd", func(s *BgpServer) error {
+			return s.bfdDown(context.Background(), netip.MustParseAddr(peerAddr))
+		}, 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = 3
+			})
+			m := establishSession(t, s, peer, asn, peerAddr)
+
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			require.NoError(t, tt.down(s))
+			w.Wait(t, 10*time.Second)
+
+			require.Eventually(t, func() bool {
+				n := sentNotification(m)
+				return n != nil && n.ErrorCode == bgp.BGP_ERROR_CEASE && n.ErrorSubcode == bgp.BGP_ERROR_SUB_BFD_DOWN
+			}, 10*time.Second, 10*time.Millisecond)
+			var hold float64
+			require.NoError(t, s.mgmtOperation(func() error {
+				hold = peer.fsm.idleHoldTime
+				return nil
+			}, false))
+			require.Equal(t, tt.wantHold, hold)
+		})
+	}
+}
+
+// A reset that arrives while an enabled peer waits a backed-off idle hold
+// time shortens the running idle hold timer to IdleHoldTimeAfterReset,
+// counted from the reset. It never makes it longer.
+// https://github.com/osrg/gobgp/issues/3740
+func TestResetPeerShortensRunningIdleHoldTimer(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+	for _, tt := range []struct {
+		name       string
+		afterReset float64
+		min, max   time.Duration
+	}{
+		{"after reset 1 s", 1, 500 * time.Millisecond, 2 * time.Second},
+		// 30 s is longer than the rest of the 4 s: the timer is kept
+		{"after reset 30 s", 30, 2500 * time.Millisecond, 6 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, peer := startServerWithPassivePeer(t, asn, peerAddr, func(n *oc.Neighbor) {
+				n.Timers.Config.IdleHoldTimeAfterReset = tt.afterReset
+			})
+			ctx := context.Background()
+			m := establishSession(t, s, peer, asn, peerAddr)
+			notification := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_OTHER_CONFIGURATION_CHANGE, nil)
+
+			// A NOTIFICATION from the peer ends the session (idle hold
+			// time 2 s), another one in OpenConfirm ends the next
+			// connection (4 s, FRR bgp_stop_with_error).
+			w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			m.PushBgpMessage(notification)
+			w.Wait(t, 10*time.Second)
+			waitPeerState(t, s, api.PeerState_SESSION_STATE_ACTIVE, 10*time.Second)
+
+			m2 := NewMockConnection()
+			m2.SetRemoteAddr(peerAddr)
+			t.Cleanup(func() { m2.Close() })
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_OPENCONFIRM)
+			peer.fsm.connCh <- m2
+			open, err := bgp.NewBGPOpenMessage(uint16(asn), 90, netip.MustParseAddr(peerAddr),
+				[]bgp.OptionParameterInterface{bgp.NewOptionParameterCapability([]bgp.ParameterCapabilityInterface{bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC)})})
+			require.NoError(t, err)
+			go m2.PushBgpMessage(open)
+			w.Wait(t, 10*time.Second)
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+			go m2.PushBgpMessage(notification)
+			w.Wait(t, 10*time.Second)
+
+			w = newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ACTIVE)
+			time.Sleep(500 * time.Millisecond)
+			start := time.Now()
+			require.NoError(t, s.ResetPeer(ctx, &api.ResetPeerRequest{Address: peerAddr, BfdDown: true}))
+			w.Wait(t, 40*time.Second)
+			took := time.Since(start)
+			require.Less(t, took, tt.max)
+			require.Greater(t, took, tt.min)
+		})
+	}
+}
