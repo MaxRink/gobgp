@@ -2172,9 +2172,9 @@ func TestFSMHandlerOpenconfirm_Collision(t *testing.T) {
 	}
 }
 
-// active() can start a new outgoing connection manager and then take the
-// connection that the previous manager left. The new manager must not keep
-// running: it would open another connection to the peer.
+// active() takes the connection that the previous manager left and starts
+// no new manager: it would open another connection to the peer. (Upstream
+// starts one and stops it; the fork does not start it.)
 func TestFSMHandlerActive_StopsManagerWithOutgoingConn(t *testing.T) {
 	m := NewMockConnection()
 	p, h := makePeerAndHandler(m)
@@ -2189,8 +2189,7 @@ func TestFSMHandlerActive_StopsManagerWithOutgoingConn(t *testing.T) {
 	state, _ := h.active(t.Context())
 	require.Equal(t, bgp.BGP_FSM_OPENCONFIRM, state)
 	require.Same(t, outgoing, p.fsm.conn)
-	require.NotNil(t, p.fsm.outgoingConnMgr)
-	require.Error(t, p.fsm.outgoingConnMgr.ctx.Err())
+	require.Nil(t, p.fsm.outgoingConnMgr, "a new manager was started")
 }
 
 // In OpenSent on the incoming connection, the peer's OPEN arrives on our own
@@ -2799,4 +2798,24 @@ func TestOutgoingConnManagerKeepsRunningInOpenConfirm(t *testing.T) {
 	t.Cleanup(func() { ocm.stop(nil) })
 	time.Sleep(500 * time.Millisecond)
 	require.NoError(t, ocm.ctx.Err(), "the outgoing connection manager ended")
+}
+
+// active() takes a connection that the last manager left in
+// outgoingConnCh and starts no new manager: a new one would open another
+// connection to the peer, with connect-at-once at once.
+func TestFSMHandlerActive_PendingOutgoingConnNoNewManager(t *testing.T) {
+	p, h, _ := collisionHandler(t, "10.0.0.9")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // the manager returned after it handed over the connection
+	done := &outgoingConnManager{ctx: ctx, cancel: cancel, fsm: p.fsm}
+	p.fsm.outgoingConnMgr = done
+	out := NewMockConnection()
+	t.Cleanup(func() { out.Close() })
+	p.fsm.outgoingConnCh <- outgoingConn{conn: out, open: openFrom(t, "10.0.0.1")}
+
+	state, _ := h.active(t.Context())
+
+	require.Equal(t, bgp.BGP_FSM_OPENCONFIRM, state)
+	require.Same(t, done, p.fsm.outgoingConnMgr)
+	require.Same(t, out, p.fsm.conn.(*MockConnection))
 }

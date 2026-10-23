@@ -1254,15 +1254,22 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 			}
 
 		case r := <-fsm.resetCh:
-			// ResetPeer. Like FRR, ignore it while the peer is
-			// administratively down.
+			// ResetPeer. Ignored while the peer is administratively
+			// down, as upstream does (95c43b00). FRR peer_clear skips
+			// only a peer whose instance is shut down too; for a peer
+			// with "neighbor shutdown" alone it resets v_start to 1,
+			// but the start timer does not run, so the next start
+			// waits 1 s either way.
 			if fsm.adminState.Load() == adminStateUp {
 				conf := fsm.pConf.ReadOnly()
 				fsm.idleHoldTime, fsm.idleHoldBackoff = nextIdleHoldTime(fsm.idleHoldBackoff, conf.Timers.Config.IdleHoldTimeAfterReset, bgp.BGP_FSM_IDLE, r.reason(nil))
-				// The reset shortens the running timer to the idle
-				// hold time after reset, counted from now, and never
-				// makes it longer: FRR does not restart the start timer
-				// of a peer in Idle on clear bgp.
+				// FRR peer_clear in Idle sets v_start to 1 and re-arms
+				// the start timer (bgp_stop, then bgp_timer_set), so the
+				// peer starts 1 s from the reset. The fork deliberately
+				// only shortens the running timer to the idle hold time
+				// after reset, counted from now, and never makes the wait
+				// longer. With BOOTy's IdleHoldTimeAfterReset of 1 s this
+				// differs from FRR only when less than 1 s remains.
 				d := time.Second * time.Duration(fsm.idleHoldTime)
 				if !idleHoldDeadline.IsZero() && time.Now().Add(d).Before(idleHoldDeadline) {
 					idleHoldTimer.Reset(d)
@@ -1402,7 +1409,10 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 	fsm := h.fsm
 	h.collided = false
 
-	if fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil {
+	// A connection that the last manager left in outgoingConnCh is taken
+	// below; a new manager would open another one to the peer (with
+	// connect-at-once at once) only to be stopped when it is taken.
+	if (fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil) && len(fsm.outgoingConnCh) == 0 {
 		fsm.logger.Info("starting outgoing connection manager")
 		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, firstConnectDelay(fsm.pConf.ReadOnly().Timers.Config.ConnectAtOnce))
 	}
@@ -1449,14 +1459,14 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 				fsm.recvOpen = result.open
 				fsm.lock.Unlock()
 
-				// The manager that sent this connection has returned, but
-				// this function may have started a new one above, when it
-				// found the old one done. The session now uses our own
-				// connection, so another outgoing connection is not
-				// needed. openconfirm() relies on this: an outgoing
+				// The manager that sent this connection has returned, and
+				// no new one was started above while the connection was
+				// pending. The session now uses our own connection, so
+				// another outgoing connection is not needed; stop() makes
+				// sure of it. openconfirm() relies on this: an outgoing
 				// connection that it receives always collides with an
 				// incoming one.
-				fsm.outgoingConnMgr.stop(nil)
+				fsm.stopOutgoingConnMgr(nil)
 
 				return bgp.BGP_FSM_OPENCONFIRM, newfsmStateReason(fsmOpenMsgReceived, nil, nil)
 			}

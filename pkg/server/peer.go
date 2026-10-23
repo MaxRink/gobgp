@@ -739,13 +739,15 @@ func (peer *peer) sendNotification(msg *bgp.BGPMessage) {
 	nonblockSendChannel(peer.fsm.notification, msg)
 }
 
-// reset passes ResetPeer to the FSM. The latest reset replaces one that the
-// FSM has not taken yet, so that a reset with bfd_down is not lost behind
-// an administrative one. Only the server goroutine sends on resetCh, so the
-// send after the drain does not block.
+// reset passes ResetPeer to the FSM. A reset that the FSM has not taken
+// yet is merged into the new one: the latest communication is sent, and
+// bfd_down stays set if either reset had it, so a BFD reset is never
+// downgraded to Cease/Administrative Reset. Only the server goroutine sends
+// on resetCh, so the send after the drain does not block.
 func (peer *peer) reset(r peerReset) {
 	select {
-	case <-peer.fsm.resetCh:
+	case old := <-peer.fsm.resetCh:
+		r.bfdDown = r.bfdDown || old.bfdDown
 	default:
 	}
 	peer.fsm.resetCh <- r

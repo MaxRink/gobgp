@@ -219,6 +219,21 @@ func TestResetTwiceLatestWins(t *testing.T) {
 	require.Equal(t, []uint8{bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_BFD_DOWN}, []uint8{n.ErrorCode, n.ErrorSubcode})
 }
 
+// A plain reset that follows a bfd_down reset that the FSM has not taken
+// yet keeps bfd_down: the BFD reset is not downgraded to Cease/
+// Administrative Reset.
+func TestResetAfterBfdDownKeepsBfdDown(t *testing.T) {
+	p, h := makePeerAndHandler(NewMockConnection())
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	p.reset(peerReset{bfdDown: true})
+	p.reset(peerReset{communication: []byte("second")})
+	require.Len(t, p.fsm.resetCh, 1)
+	r := <-p.fsm.resetCh
+	require.True(t, r.bfdDown, "the plain reset downgraded the bfd_down reset")
+	n := r.notification().Body.(*bgp.BGPNotification)
+	require.Equal(t, []uint8{bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_BFD_DOWN}, []uint8{n.ErrorCode, n.ErrorSubcode})
+}
+
 // A ResetPeer of a peer without a session sets the backoff back to 1 s,
 // like peer_clear of FRR without a session (bgpd.c:8433 of FRR 10.2.1:
 // v_start = 1, no NOTIFICATION to double it). A ResetPeer with bfd_down
