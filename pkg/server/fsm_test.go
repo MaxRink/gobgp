@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1336,7 +1337,7 @@ func TestRecvMessageWithError_MalformedNextHop(t *testing.T) {
 		// handled inside recvMessageWithError. The panic only occurs when
 		// treat-as-withdraw is enabled and the malformed attribute survives
 		// into ValidateUpdateMsg.
-		h.fsm.isTreatAsWithdraw = true
+		h.fsm.isTreatAsWithdraw.Store(true)
 
 		go m.remote.Write(raw)
 
@@ -1360,7 +1361,7 @@ func TestRecvMessageWithError_MalformedNextHop(t *testing.T) {
 		})
 
 		// Without RFC 7606, the error should cause a session reset.
-		h.fsm.isTreatAsWithdraw = false
+		h.fsm.isTreatAsWithdraw.Store(false)
 
 		go m.remote.Write(raw)
 
@@ -1847,7 +1848,7 @@ func recvUpdate(t *testing.T, raw []byte) (*fsmMsg, *bgp.BGPMessage) {
 	p, h := makePeerAndHandler(m)
 	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
 
-	h.fsm.isTreatAsWithdraw = true
+	h.fsm.isTreatAsWithdraw.Store(true)
 	h.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_NONE})
 
 	received := make(chan *fsmMsg, 1)
@@ -2239,9 +2240,13 @@ func TestFSMHandlerOpensent_OutgoingOpenFirst(t *testing.T) {
 			}()
 
 			if tt.wantOutgoing {
-				requireCollisionCease(t, sentMessage(t, incoming, 0))
 				msg := sentMessage(t, outgoing, 0)
 				require.Equal(t, uint8(bgp.BGP_MSG_KEEPALIVE), msg.Header.Type)
+				// Fork: the incoming connection is closed only when
+				// the peer's OPEN arrives on it (trackCollisionLoser).
+				require.Empty(t, incoming.GetSentMessages())
+				go incoming.PushBgpMessage(open)
+				requireCollisionCease(t, sentMessage(t, incoming, 0))
 			} else {
 				requireCollisionCease(t, sentMessage(t, outgoing, 0))
 				// Still in OpenSent: the OPEN on the incoming
@@ -2648,4 +2653,150 @@ func TestCapabilitiesPathsLimit(t *testing.T) {
 	require.Equal(t, []*bgp.CapPathsLimitTuple{{Family: bgp.RF_IPv4_UC, Limit: 0}}, limits(afs))
 	require.Nil(t, limits(afs[1:]), "ADD-PATH send only")
 	require.Nil(t, limits(afs[2:]), "no ADD-PATH")
+}
+
+func collisionHandler(t *testing.T, localID string) (*peer, *fsmHandler, *MockConnection) {
+	t.Helper()
+	in := NewMockConnection()
+	p, h := makePeerAndHandler(in)
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	p.fsm.gConf.Config.RouterId = netip.MustParseAddr(localID)
+	p.fsm.lock.Lock()
+	conf := p.fsm.pConf.ReadCopy()
+	conf.Timers.State.KeepaliveInterval = 30
+	conf.Timers.State.NegotiatedHoldTime = 90
+	p.fsm.pConf.Update(&conf)
+	p.fsm.lock.Unlock()
+	return p, h, in
+}
+
+func openFrom(t *testing.T, id string) *bgp.BGPMessage {
+	t.Helper()
+	m, err := bgp.NewBGPOpenMessage(65002, 90, netip.MustParseAddr(id), nil)
+	require.NoError(t, err)
+	return m
+}
+
+// The peer's OPEN arrives on the incoming connection while the outgoing
+// connection is dialed already. The peer may see the dialed connection and,
+// with the lower BGP Identifier, keep it and close the incoming one (RFC
+// 4271 Section 6.8). OpenSent must not stop the manager, and when the
+// incoming connection then fails, the FSM leaves Idle at once to take the
+// outgoing one.
+func TestFSMHandlerOpensent_DialedOutgoingConnKeptForCollision(t *testing.T) {
+	p, h, in := collisionHandler(t, "10.0.0.9")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ocm := &outgoingConnManager{ctx: ctx, cancel: cancel, fsm: p.fsm}
+	ocm.state.Store(bgp.BGP_FSM_CONNECT)
+	ocm.dialing.Store(true)
+	p.fsm.outgoingConnMgr = ocm
+	go in.PushBgpMessage(openFrom(t, "10.0.0.1"))
+
+	state, _ := h.opensent(t.Context())
+	require.Equal(t, bgp.BGP_FSM_OPENCONFIRM, state)
+	require.NoError(t, ocm.ctx.Err(), "the dialed outgoing connection was stopped")
+	require.True(t, ocm.keepForIdle(), "Idle stops the dialed outgoing connection")
+
+	// A manager that only waits to dial is stopped, as before: there is no
+	// other connection.
+	p2, h2, in2 := collisionHandler(t, "10.0.0.9")
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	defer cancel2()
+	waiting := &outgoingConnManager{ctx: ctx2, cancel: cancel2, fsm: p2.fsm}
+	waiting.state.Store(bgp.BGP_FSM_CONNECT)
+	p2.fsm.outgoingConnMgr = waiting
+	go in2.PushBgpMessage(openFrom(t, "10.0.0.1"))
+	state, _ = h2.opensent(t.Context())
+	require.Equal(t, bgp.BGP_FSM_OPENCONFIRM, state)
+	require.Error(t, waiting.ctx.Err(), "the waiting manager was not stopped")
+}
+
+func connectHandler(t *testing.T, port int) (*peer, *fsmHandler) {
+	t.Helper()
+	p, h := makePeerAndHandler(NewMockConnection())
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	p.fsm.lock.Lock()
+	conf := p.fsm.pConf.ReadCopy()
+	conf.State.NeighborAddress = netip.MustParseAddr("127.0.0.1")
+	conf.Transport.Config.RemotePort = uint16(port)
+	conf.Transport.Config.LocalAddress = netip.MustParseAddr("127.0.0.1")
+	p.fsm.pConf.Update(&conf)
+	p.fsm.lock.Unlock()
+	return p, h
+}
+
+func acceptOnce(t *testing.T) (port int, accepted <-chan net.Conn) {
+	t.Helper()
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	ch := make(chan net.Conn, 1)
+	go func() {
+		c, err := l.Accept()
+		if err == nil {
+			ch <- c
+		}
+	}()
+	t.Cleanup(func() {
+		l.Close()
+		select {
+		case c := <-ch:
+			c.Close()
+		default:
+		}
+	})
+	return l.Addr().(*net.TCPAddr).Port, ch
+}
+
+// A dial that succeeded leaves the dialing mark set.
+func TestConnectLoopMarksDialed(t *testing.T) {
+	port, _ := acceptOnce(t)
+	_, h := connectHandler(t, port)
+	var dialing atomic.Bool
+	conn := h.connectLoop(t.Context(), 0, &dialing)
+	require.NotNil(t, conn)
+	t.Cleanup(func() { conn.Close() })
+	require.True(t, dialing.Load(), "a dialed connection is not marked")
+}
+
+// RFC 4271 Section 8.2.2: no connect retry in OpenConfirm. connectLoop
+// does not dial and does not return while the FSM is in OpenConfirm, and
+// dials when the FSM is back in Active.
+func TestConnectLoopWaitsInOpenConfirm(t *testing.T) {
+	port, accepted := acceptOnce(t)
+	p, h := connectHandler(t, port)
+	p.fsm.state.Store(bgp.BGP_FSM_OPENCONFIRM)
+	var dialing atomic.Bool
+	done := make(chan net.Conn, 1)
+	go func() { done <- h.connectLoop(t.Context(), 0, &dialing) }()
+	select {
+	case <-accepted:
+		t.Fatal("connectLoop dialed in OpenConfirm")
+	case <-done:
+		t.Fatal("connectLoop returned in OpenConfirm")
+	case <-time.After(500 * time.Millisecond):
+	}
+	p.fsm.state.Store(bgp.BGP_FSM_ACTIVE)
+	select {
+	case conn := <-done:
+		require.NotNil(t, conn)
+		conn.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("connectLoop did not dial after the FSM went back to Active")
+	}
+}
+
+// The outgoing connection manager keeps running in OpenConfirm when its
+// dial fails; it ends only when it is stopped.
+func TestOutgoingConnManagerKeepsRunningInOpenConfirm(t *testing.T) {
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close()) // the dial is refused
+	p, _ := connectHandler(t, port)
+	p.fsm.state.Store(bgp.BGP_FSM_OPENCONFIRM)
+	ocm := newOutGoingConnManager(t.Context(), p.fsm, 0)
+	t.Cleanup(func() { ocm.stop(nil) })
+	time.Sleep(500 * time.Millisecond)
+	require.NoError(t, ocm.ctx.Err(), "the outgoing connection manager ended")
 }
