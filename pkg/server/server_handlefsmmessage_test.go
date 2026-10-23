@@ -2830,11 +2830,15 @@ func TestHandleFSMMessage_DisableDuringRestart(t *testing.T) {
 	grDown(t, s, p)
 
 	require.NoError(t, s.DisablePeer(context.Background(), &api.DisablePeerRequest{Address: "10.0.0.1"}))
-	assert.False(t, p.grRestarting())
-	assert.Equal(t, 0, grCount(s, p, bgp.RF_IPv4_UC))
-	assert.Equal(t, 0, grCount(s, p, bgp.RF_IPv6_UC))
+	// BOOTy disables a peer on carrier loss and needs the stale routes of
+	// a restarting peer to stay, as FRR keeps them in NSF wait across
+	// interface down and up (bgp_stop in bgp_fsm.c). The restart timer
+	// still runs and removes them when it expires.
+	assert.True(t, p.grRestarting())
+	assert.Equal(t, 1, grCount(s, p, bgp.RF_IPv4_UC))
+	assert.Equal(t, 1, grCount(s, p, bgp.RF_IPv6_UC))
 	p.grMu.Lock()
-	assert.Nil(t, p.grRestartTimer)
+	assert.NotNil(t, p.grRestartTimer)
 	p.grMu.Unlock()
 }
 

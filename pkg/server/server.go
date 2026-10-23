@@ -4883,7 +4883,12 @@ func (s *BgpServer) setAdminState(addr, communication string, state adminState) 
 			f(&adminStateOperation{adminStateUp, nil}, "adminStateUp requested")
 		case adminStateDown:
 			f(&adminStateOperation{adminStateDown, newAdministrativeCommunication(communication)}, "adminStateDown requested")
-			s.grAbort(peer)
+			// BOOTy keeps the peer (and its graceful restart state) while
+			// the carrier of its interface is down: an administrative
+			// shutdown must not drop the stale routes of a restarting
+			// peer. FRR keeps them in NSF wait across interface down and
+			// up too (bgp_stop in bgp_fsm.c). The restart timer still
+			// removes them when it expires.
 		case adminStatePfxCt:
 			f(&adminStateOperation{adminStatePfxCt, nil}, "adminStatePfxCt requested")
 		}
