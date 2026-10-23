@@ -71,3 +71,18 @@ code contributing.
 GoBGP is licensed under the Apache License, Version 2.0. See
 [LICENSE](https://github.com/osrg/gobgp/blob/master/LICENSE) for the full
 license text.
+
+## Fork branch booty/master
+
+This branch is upstream GoBGP master at 6d26fa29 (2026-10-23, after
+v4.10.0; there is no newer release) with the fixes and features that
+BOOTy needs and upstream does not have yet, released as the tags
+`v4.10.0-booty.N` from `v4.10.0-booty.23` on. `v4.10.0-booty.17` to
+`v4.10.0-booty.22` were on upstream master 57fa92f1; the old commits stay
+reachable through their tags. The idle hold time backs off like v_start
+of FRR 10.2.1, not like upstream 4e70e768. The tags up to
+`v4.10.0-booty.16` are on the branch `booty/v4.10` (based on v4.10.0). Do
+not use `v4.10.0-booty.7`: it stops answering a NOTIFICATION in OpenSent,
+which RFC 4271 Section 8.2.2 does not allow. A neighbor set entry can
+carry an IPv6 zone ("fe80::1%eth0/128") that must match the zone of the
+neighbor address.
