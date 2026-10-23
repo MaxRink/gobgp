@@ -2604,15 +2604,20 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 
 func (h *fsmHandler) changeadminState(s adminState) error {
 	fsm := h.fsm
+	// Only the handler goroutine changes the admin state, so Load and
+	// CompareAndSwap see the same value: compare with s itself. The CAS of
+	// old with the value just loaded always succeeded, so a request for the
+	// current state toggled State.AdminDown and restarted the idle hold
+	// timer.
 	old := fsm.adminState.Load()
-	if fsm.adminState.CompareAndSwap(old, s) {
+	if old != s && fsm.adminState.CompareAndSwap(old, s) {
 		fsm.logger.Debug("admin state changed",
 			slog.String("State", fsm.state.String()),
 			slog.String("adminState", s.String()))
 
 		h.fsm.lock.Lock()
 		conf := fsm.pConf.ReadCopy()
-		conf.State.AdminDown = !conf.State.AdminDown
+		conf.State.AdminDown = s != adminStateUp
 		fsm.pConf.Update(&conf)
 		h.fsm.lock.Unlock()
 
