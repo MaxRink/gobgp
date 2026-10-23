@@ -71,3 +71,38 @@ code contributing.
 GoBGP is licensed under the Apache License, Version 2.0. See
 [LICENSE](https://github.com/osrg/gobgp/blob/master/LICENSE) for the full
 license text.
+
+## Fork branch booty/master
+
+This branch is upstream GoBGP master at 629e5ae8 (2026-11-01, after
+v4.11.0) with the fixes and features that BOOTy needs and upstream does
+not have yet, released as the tags `v4.11.0-booty.N` from
+`v4.11.0-booty.1` on. The tags `v4.10.0-booty.17` to `v4.10.0-booty.24`
+were on upstream master 6d26fa29, and `v4.10.0-booty.1` to
+`v4.10.0-booty.16` on the branch `booty/v4.10` (based on v4.10.0). The
+old commits stay reachable through their tags. Do not use
+`v4.10.0-booty.7`: it stops answering a NOTIFICATION in OpenSent, which
+RFC 4271 Section 8.2.2 does not allow.
+
+The fork keeps what upstream still lacks:
+
+- the idle hold backoff rules of `v_start` of FRR 10.2.1, and the reset
+  rules of `peer_clear`, instead of those of upstream 4e70e768;
+- the opt-in `ResetPeerRequest.BfdDown` (Cease/BFD Down without waiting
+  for the idle hold backoff of the native BFD);
+- the opt-in `TimersConfig.ConnectAtOnce`;
+- Enhanced Route Refresh (RFC 7313), including the bound on the stale
+  routes of a BoRR without an EoRR;
+- the Paths-Limit capability (draft-abraitis-idr-addpath-paths-limit);
+- the connection collision cases that upstream does not cover;
+- the graceful restart stale routes of a peer that is disabled while it
+  restarts: BOOTy disables a peer on carrier loss, and FRR keeps those
+  routes in NSF wait across interface down and up.
+
+The fork drops the fixes that upstream has merged: EVPN NLRIs of unknown
+route types (#3742), the EVPN ARP/ND extended community (#3746), the
+IPv6 zone of a neighbor set entry (#3790), the admin state idempotence
+and queue (#3788, #3789), a new connection from a restarting peer
+(#3745), a connection that arrives with an idle hold time of zero
+(#3879), out-of-range RD/RT values (#3869), and per-bind-interface BFD
+listeners (#3862).
