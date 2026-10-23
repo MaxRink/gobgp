@@ -58,8 +58,12 @@ const (
 )
 
 // firstConnectDelay returns the wait before the first connection attempt
-// after the FSM leaves Idle.
-func firstConnectDelay() time.Duration {
+// after the FSM leaves Idle. With atOnce (timers connect-at-once) there is
+// no wait, like FRR, which connects when BGP_Start runs.
+func firstConnectDelay(atOnce bool) time.Duration {
+	if atOnce {
+		return 0
+	}
 	return time.Duration(rand.Float64() * float64(firstConnectDelayMax))
 }
 
@@ -1202,7 +1206,7 @@ func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason)
 
 	if fsm.outgoingConnMgr == nil || fsm.outgoingConnMgr.ctx.Err() != nil {
 		fsm.logger.Info("starting outgoing connection manager")
-		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, firstConnectDelay())
+		fsm.outgoingConnMgr = newOutGoingConnManager(ctx, fsm, firstConnectDelay(fsm.pConf.ReadOnly().Timers.Config.ConnectAtOnce))
 	}
 
 	for {

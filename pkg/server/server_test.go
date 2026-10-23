@@ -7060,6 +7060,48 @@ func TestPostFilterpathExtendedNexthop(t *testing.T) {
 	}
 }
 
+// With connect-at-once the first connect of a peer starts at once, so a new
+// session is up well before the longest first connect delay of upstream (1 s).
+// Without it the first connect waits a random time below 1 s.
+func TestFirstConnectAtOnce(t *testing.T) {
+	require.Zero(t, firstConnectDelay(true))
+	for range 100 {
+		require.Less(t, firstConnectDelay(false), firstConnectDelayMax)
+	}
+
+	ctx := t.Context()
+	l, err := (&net.ListenConfig{}).Listen(ctx, "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+
+	start := func(asn uint32, id string, listen int32) *BgpServer {
+		s := NewBgpServer()
+		go s.Serve()
+		require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{
+			Asn: asn, RouterId: id, ListenPort: listen, ListenAddresses: []string{"127.0.0.1"},
+		}}))
+		t.Cleanup(func() { _ = s.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+		return s
+	}
+	passive := start(1, "1.1.1.1", int32(port))
+	active := start(2, "2.2.2.2", -1)
+	require.NoError(t, passive.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+		Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 2},
+		Transport: &api.Transport{PassiveMode: true},
+	}}))
+
+	w := newPeerStateWaiter(active, api.PeerState_SESSION_STATE_ESTABLISHED)
+	begin := time.Now()
+	require.NoError(t, active.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+		Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 1},
+		Transport: &api.Transport{RemotePort: uint32(port)},
+		Timers:    &api.Timers{Config: &api.TimersConfig{ConnectAtOnce: true}},
+	}}))
+	w.Wait(t, 10*time.Second)
+	require.Less(t, time.Since(begin), 500*time.Millisecond, "the first connect waited")
+}
+
 // establishEnhancedRefreshSession is establishSession with the route
 // refresh and enhanced route refresh capabilities in the peer's OPEN.
 func establishEnhancedRefreshSession(t *testing.T, s *BgpServer, peer *peer, asn uint32, peerAddr string) *MockConnection {
