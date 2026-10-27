@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"runtime"
 	"slices"
@@ -6334,6 +6335,57 @@ func TestPostFilterpathExtendedNexthop(t *testing.T) {
 				got := s.postFilterpath(peer, v4)
 				require.NotNil(t, got, c.name)
 				require.False(t, got.IsWithdraw, "%s: IPv4 next hop", c.name)
+			}
+		})
+	}
+}
+
+// With connect-at-once the first connect of a peer starts at once, so a new
+// session is up well before the jittered retry delay (1.5 to 2 s with
+// minConnectRetryInterval). Without it the first connect still waits.
+func TestFirstConnectAtOnce(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		now  bool
+	}{
+		{"connect-at-once", true},
+		{"default", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			l, err := (&net.ListenConfig{}).Listen(ctx, "tcp4", "127.0.0.1:0")
+			require.NoError(t, err)
+			port := l.Addr().(*net.TCPAddr).Port
+			require.NoError(t, l.Close())
+
+			start := func(asn uint32, id string, listen int32) *BgpServer {
+				s := NewBgpServer()
+				go s.Serve()
+				require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{
+					Asn: asn, RouterId: id, ListenPort: listen, ListenAddresses: []string{"127.0.0.1"},
+				}}))
+				t.Cleanup(func() { _ = s.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+				return s
+			}
+			passive := start(1, "1.1.1.1", int32(port))
+			active := start(2, "2.2.2.2", -1)
+			require.NoError(t, passive.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+				Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 2},
+				Transport: &api.Transport{PassiveMode: true},
+			}}))
+
+			w := newPeerStateWaiter(active, api.PeerState_SESSION_STATE_ESTABLISHED)
+			begin := time.Now()
+			require.NoError(t, active.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+				Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 1},
+				Transport: &api.Transport{RemotePort: uint32(port)},
+				Timers:    &api.Timers{Config: &api.TimersConfig{ConnectAtOnce: tt.now}},
+			}}))
+			w.Wait(t, 10*time.Second)
+			if tt.now {
+				require.Less(t, time.Since(begin), time.Second, "the first connect waited for the retry delay")
+			} else {
+				require.GreaterOrEqual(t, time.Since(begin), time.Second, "the first connect did not wait")
 			}
 		})
 	}
