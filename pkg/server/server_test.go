@@ -6338,3 +6338,23 @@ func TestPostFilterpathExtendedNexthop(t *testing.T) {
 		})
 	}
 }
+
+func TestResetPeerBfdDown(t *testing.T) {
+	const (
+		asn      = 65001
+		peerAddr = "10.0.0.1"
+	)
+
+	s, peer := startServerWithPassivePeer(t, asn, peerAddr)
+	m := establishSession(t, s, peer, asn, peerAddr)
+
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_IDLE)
+	require.NoError(t, s.ResetPeer(context.Background(), &api.ResetPeerRequest{Address: peerAddr, BfdDown: true}))
+	w.Wait(t, 10*time.Second)
+
+	require.Eventually(t, func() bool {
+		n := sentNotification(m)
+		return n != nil && n.ErrorCode == bgp.BGP_ERROR_CEASE && n.ErrorSubcode == bgp.BGP_ERROR_SUB_BFD_DOWN
+	}, 10*time.Second, 10*time.Millisecond)
+	require.Equal(t, float64(2*idleHoldTimeInitial), peer.fsm.idleHoldTime)
+}
