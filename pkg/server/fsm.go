@@ -929,6 +929,15 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 			}
 			conn.Close()
 			fsm.logger.Warn("Closed an accepted connection", slog.String("State", fsm.state.String()))
+		case m := <-fsm.notification:
+			// ResetPeer while the peer has no session: there is nothing
+			// to send, but the next start still waits the idle hold time
+			// after reset, as it does after a reset of a session (as in
+			// v3). An administratively down peer starts with it when it
+			// is enabled.
+			if b := notificationBody(m); b != nil && b.ErrorCode == bgp.BGP_ERROR_CEASE && b.ErrorSubcode == bgp.BGP_ERROR_SUB_ADMINISTRATIVE_RESET {
+				fsm.idleHoldTime = fsm.pConf.ReadOnly().Timers.Config.IdleHoldTimeAfterReset
+			}
 		case <-idleHoldTimer.C:
 			if fsm.adminState.Load() == adminStateUp {
 				fsm.logger.Debug("IdleHoldTimer expired", slog.String("State", fsm.state.String()), slog.Int("Duration", int(fsm.idleHoldTime)))
