@@ -92,17 +92,20 @@ RFC 4271 Section 8.2.2 does not allow.
 The fork keeps what upstream still lacks:
 
 - the idle hold backoff rules of `v_start` of FRR 10.2.1, and the reset
-  rules of `peer_clear`, instead of those of upstream 4e70e768;
+  rules of `peer_clear`, instead of those of upstream 4e70e768
+  (osrg/gobgp#3860, #3859);
 - the opt-in `ResetPeerRequest.BfdDown` (Cease/BFD Down without waiting
-  for the idle hold backoff of the native BFD);
-- the opt-in `TimersConfig.ConnectAtOnce`;
+  for the idle hold backoff of the native BFD; osrg/gobgp#3895);
+- the opt-in `TimersConfig.ConnectAtOnce` (osrg/gobgp#3896);
 - Enhanced Route Refresh (RFC 7313), including the bound on the stale
-  routes of a BoRR without an EoRR;
-- the Paths-Limit capability (draft-abraitis-idr-addpath-paths-limit);
-- the connection collision cases that upstream does not cover;
+  routes of a BoRR without an EoRR (osrg/gobgp#3647, #3870);
+- the Paths-Limit capability (draft-abraitis-idr-addpath-paths-limit;
+  osrg/gobgp#2786, the PR was closed because the draft is not adopted);
+- the connection collision cases that upstream does not cover
+  (osrg/gobgp#3863, #3898);
 - the graceful restart stale routes of a peer that is disabled while it
   restarts: BOOTy disables a peer on carrier loss, and FRR keeps those
-  routes in NSF wait across interface down and up;
+  routes in NSF wait across interface down and up (osrg/gobgp#3897);
 - a new connection while the session is established ends the session
   only when the new OPEN says that the peer preserved forwarding state.
   The GR F bit wins per family; an LLGR tuple counts only for a family
@@ -111,7 +114,8 @@ The fork keeps what upstream still lacks:
   zero, so its late connection stays a collision; closing the just-
   recovered session for it drops it a second time. The decision reads the
   new OPEN, not the established session's capability, so a peer that
-  started with F=0 can still restart with forwarding state preserved.
+  started with F=0 can still restart with forwarding state preserved
+  (osrg/gobgp#3894).
 
 The fork drops the fixes that upstream has merged: EVPN NLRIs of unknown
 route types (#3742), the EVPN ARP/ND extended community (#3746), the
