@@ -61,6 +61,25 @@ func (n *Negotiated) HasFamilies() bool {
 	return len(n.grFamilies()) > 0 || len(n.llgrTuples()) > 0
 }
 
+// HasForwardingState reports whether the peer preserved forwarding state for
+// at least one family (the F bit of RFC 4724 Section 3 or RFC 9494 Section 3).
+// A helper-only peer advertises its families with F=0: a new connection from
+// it while the session is established is a connection collision, not a
+// restart, and its routes cannot be used without its forwarding state.
+func (n *Negotiated) HasForwardingState() bool {
+	for _, preserved := range n.grFamilies() {
+		if preserved {
+			return true
+		}
+	}
+	for _, t := range n.llgrTuples() {
+		if t.Flags&fBit != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // grFamilies returns the families that n negotiated and that are in its
 // Graceful Restart Capability, with whether the F bit is set for each.
 func (n *Negotiated) grFamilies() map[bgp.Family]bool {

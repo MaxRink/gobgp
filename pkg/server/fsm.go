@@ -2635,7 +2635,12 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 				break
 			}
 			n := fsm.grNegotiated()
-			if !n.HasFamilies() {
+			// A helper-only peer advertises its families with F=0. It did
+			// not preserve forwarding state, so a new connection from it is
+			// a collision, not a restart: closing the established session
+			// for it drops the just-recovered session a second time (FRR
+			// leaves in the production template lab).
+			if !n.HasForwardingState() {
 				conn.Close()
 				fsm.logger.Warn("Closed an accepted connection", slog.String("State", fsm.state.String()))
 				break

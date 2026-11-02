@@ -2933,10 +2933,11 @@ func TestFSMHandlerEstablished_NoGracefulRestartAfterCapabilityRemoved(t *testin
 }
 
 // A new connection from the peer while the session is established ends the
-// session when the peer advertised graceful restart or long-lived graceful
-// restart for one or more families (RFC 4724 Section 4.2). The old
-// connection is closed without a NOTIFICATION, and active() takes the new
-// one. Otherwise the new connection is closed.
+// session when the peer preserved forwarding state for one or more families
+// in its graceful restart or long-lived graceful restart capability
+// (RFC 4724 Section 4.2). The old connection is closed without a
+// NOTIFICATION, and active() takes the new one. Otherwise the new
+// connection is closed as a collision.
 func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2948,12 +2949,23 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, true),
 			}),
 		}, true},
+		{"graceful restart without forwarding state", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
+				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, false),
+			}),
+		}, false},
 		{"long-lived graceful restart only", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 0, nil),
 			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
 				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv4_UC, true, 3600),
 			}),
 		}, true},
+		{"long-lived graceful restart without forwarding state", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 0, nil),
+			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
+				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv4_UC, false, 3600),
+			}),
+		}, false},
 		{"no family in the capability", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 120, nil),
 		}, false},
