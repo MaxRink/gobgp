@@ -1749,6 +1749,14 @@ func readAll(conn net.Conn, length int) ([]byte, error) {
 // arrives while the session is established.
 const newConnectionOpenTimeout = 5 * time.Second
 
+// openResult is the OPEN of a connection that arrived while the session is
+// established, read in a goroutine so administrative events are not blocked.
+type openResult struct {
+	open *bgp.BGPMessage
+	raw  []byte
+	err  error
+}
+
 // replayConn replays the bytes of the OPEN that established() read before it
 // handed the connection to active().
 type replayConn struct {
@@ -1763,6 +1771,16 @@ func (c *replayConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	return c.Conn.Read(p)
+}
+
+// SyscallConn forwards the socket to netutils, which sets TTL, MSS and TOS on
+// the restarted connection in initializeConn().
+func (c *replayConn) SyscallConn() (syscall.RawConn, error) {
+	sc, ok := c.Conn.(syscall.Conn)
+	if !ok {
+		return nil, fmt.Errorf("connection does not implement syscall.Conn")
+	}
+	return sc.SyscallConn()
 }
 
 // readOpen reads the OPEN that the peer sends first on conn and returns it
@@ -2631,6 +2649,20 @@ func (h *fsmHandler) recvMessageloop(ctx context.Context, conn net.Conn, holdtim
 func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
 
+	// A connection that arrives while the session is established is
+	// inspected in the background: its OPEN decides whether it is a
+	// graceful restart or a late collision, and the FSM must keep
+	// processing administrative events meanwhile.
+	var (
+		pendingConn net.Conn
+		openCh      <-chan openResult
+	)
+	defer func() {
+		if pendingConn != nil {
+			pendingConn.Close()
+		}
+	}()
+
 	// reset the write deadline that was set in the connection establishment.
 	fsm.conn.SetWriteDeadline(time.Time{})
 
@@ -2687,20 +2719,41 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			if !ok {
 				break
 			}
+			// The OPEN is read in the background: the FSM must keep
+			// processing administrative events while a peer is slow.
+			if pendingConn != nil {
+				pendingConn.Close()
+			}
+			pendingConn = conn
+			ch := make(chan openResult, 1)
+			openCh = ch
+			go func(c net.Conn, ch chan<- openResult) {
+				open, raw, err := readOpen(c, newConnectionOpenTimeout)
+				ch <- openResult{open: open, raw: raw, err: err}
+			}(conn, ch)
+		case res := <-openCh:
+			openCh = nil
+			conn := pendingConn
+			pendingConn = nil
+			if res.err != nil {
+				conn.Close()
+				fsm.logger.Warn("Closed an accepted connection",
+					slog.String("State", fsm.state.String()),
+					slog.Any("Error", res.err))
+				break
+			}
 			// Whether this is a restart is a property of the new OPEN, not
 			// of the established session: a peer may have started with F=0
 			// and later restart with forwarding state preserved. A
 			// helper-only peer (FRR leaf) advertises F=0 and zero LLGR
-			// stale time, so its late connection stays a collision.
-			open, raw, err := readOpen(conn, newConnectionOpenTimeout)
-			if err != nil {
-				conn.Close()
-				fsm.logger.Warn("Closed an accepted connection",
-					slog.String("State", fsm.state.String()),
-					slog.Any("Error", err))
-				break
+			// stale time, so its late connection stays a collision. Only
+			// negotiated families and capabilities count.
+			conf := fsm.pConf.ReadOnly()
+			families := make(map[bgp.Family]bool)
+			for f := range fsm.familyMap.Load().(map[bgp.Family]bgp.BGPAddPathMode) {
+				families[f] = true
 			}
-			if !gr.ForwardingStateFromOpen(open) {
+			if !gr.ForwardingStateFromOpen(res.open, families, conf.GracefulRestart.Config.Enabled, conf.GracefulRestart.Config.LongLivedEnabled) {
 				conn.Close()
 				fsm.logger.Warn("Closed an accepted connection", slog.String("State", fsm.state.String()))
 				break
@@ -2735,7 +2788,7 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			// active() takes the connection. idle() would close it. The
 			// wrapper replays the OPEN that established() read.
 			select {
-			case fsm.connCh <- &replayConn{Conn: conn, pending: raw}:
+			case fsm.connCh <- &replayConn{Conn: conn, pending: res.raw}:
 			default:
 				// Another connection from the peer is queued. active()
 				// takes that one.

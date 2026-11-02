@@ -66,11 +66,16 @@ func (n *Negotiated) HasFamilies() bool {
 // forwarding state. Only such a peer is restarting; otherwise the new
 // connection is a late collision and the established session must stay.
 //
+// families is the set of families negotiated for the session; a tuple for
+// another family cannot make the new connection a restart. grEnabled and
+// llgrEnabled are what we advertised: a capability that we did not negotiate
+// does not count.
+//
 // The GR F bit wins per family. An LLGR tuple counts only for a family that
 // the GR capability does not list, and only with a nonzero stale time: FRR
 // helper-only peers always set the LLGR F bit but advertise stale time zero,
 // which preserves no routes.
-func ForwardingStateFromOpen(open *bgp.BGPMessage) bool {
+func ForwardingStateFromOpen(open *bgp.BGPMessage, families map[bgp.Family]bool, grEnabled, llgrEnabled bool) bool {
 	if open == nil || open.Header.Type != bgp.BGP_MSG_OPEN {
 		return false
 	}
@@ -88,15 +93,25 @@ func ForwardingStateFromOpen(open *bgp.BGPMessage) bool {
 		for _, c := range param.Capability {
 			switch c := c.(type) {
 			case *bgp.CapGracefulRestart:
+				if !grEnabled {
+					continue
+				}
 				// RFC 4724 Section 3: ignore all but the last instance.
 				clear(grForward)
 				for _, t := range c.Tuples {
-					grForward[bgp.NewFamily(t.AFI, t.SAFI)] = t.Flags&fBit != 0
+					if f := bgp.NewFamily(t.AFI, t.SAFI); families[f] {
+						grForward[f] = t.Flags&fBit != 0
+					}
 				}
 			case *bgp.CapLongLivedGracefulRestart:
+				if !llgrEnabled {
+					continue
+				}
 				clear(llgr)
 				for _, t := range c.Tuples {
-					llgr[bgp.NewFamily(t.AFI, t.SAFI)] = t
+					if f := bgp.NewFamily(t.AFI, t.SAFI); families[f] {
+						llgr[f] = t
+					}
 				}
 			}
 		}

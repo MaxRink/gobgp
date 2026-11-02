@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3002,7 +3003,40 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 		{"no family in the capability", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 120, nil),
 		}, nil, false},
+		{"graceful restart disabled", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
+				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, true),
+			}),
+		}, nil, false},
+		{"unnegotiated family", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
+				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv6_UC, true),
+			}),
+		}, nil, false},
+		{"long-lived graceful restart disabled", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 0, nil),
+			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
+				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv4_UC, true, 3600),
+			}),
+		}, nil, false},
 		{"no graceful restart", nil, nil, false},
+	}
+	setup := map[string]func(*peer){
+		"graceful restart disabled": func(p *peer) {
+			conf := p.fsm.pConf.ReadCopy()
+			conf.GracefulRestart.Config.Enabled = false
+			conf.GracefulRestart.State.Enabled = false
+			p.fsm.pConf.Update(&conf)
+		},
+		"unnegotiated family": func(p *peer) {
+			p.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: 0})
+		},
+		"long-lived graceful restart disabled": func(p *peer) {
+			conf := p.fsm.pConf.ReadCopy()
+			conf.GracefulRestart.Config.LongLivedEnabled = false
+			conf.GracefulRestart.State.LongLivedEnabled = false
+			p.fsm.pConf.Update(&conf)
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3013,6 +3047,9 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 			}
 			p.fsm.recvOpen = grOpen(t, session...)
 			p.fsm.stateChange(bgp.BGP_FSM_ESTABLISHED, newfsmStateReason(fsmOpenMsgNegotiated, nil, nil))
+			if fn := setup[tt.name]; fn != nil {
+				fn(p)
+			}
 
 			type result struct {
 				state  bgp.FSMState
@@ -3075,6 +3112,70 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An administrative shutdown must not wait for the OPEN of a connection that
+// arrived while the session is established. A carrier flap does
+// DisablePeer/EnablePeer while the peer may still be sending its OPEN.
+func TestFSMHandlerEstablished_AdminDownWhileNewConnectionOpenPending(t *testing.T) {
+	p, h, _ := grFirstSession(t)
+	type result struct {
+		state  bgp.FSMState
+		reason *fsmStateReason
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ch := make(chan result, 1)
+	go func() {
+		state, reason := h.established(ctx)
+		ch <- result{state, reason}
+	}()
+
+	// The peer has connected but has not sent its OPEN yet.
+	conn, remote := net.Pipe()
+	t.Cleanup(func() { remote.Close() })
+	p.fsm.connCh <- conn
+
+	p.fsm.adminStateCh <- adminStateOperation{adminStateDown, newAdministrativeCommunication("maintenance")}
+	select {
+	case r := <-ch:
+		require.Equal(t, bgp.BGP_FSM_IDLE, r.state)
+		require.Equal(t, fsmAdminDown, r.reason.Type)
+	case <-time.After(2 * time.Second):
+		t.Fatal("administrative shutdown was blocked by the pending OPEN")
+	}
+}
+
+// replayConn must keep the socket of the restarted connection. active()
+// calls initializeConn(), which sets TTL/MSS/TOS with a syscall.Conn type
+// assertion.
+func TestReplayConnKeepsSyscallConn(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		c, err := l.Accept()
+		if err == nil {
+			c.Close()
+		}
+	}()
+	conn, err := net.Dial("tcp", l.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	rc := &replayConn{Conn: conn}
+	var _ syscall.Conn = rc
+	sc, err := rc.SyscallConn()
+	require.NoError(t, err)
+	require.NotNil(t, sc)
+
+	p, h := makePeerAndHandler(NewMockConnection())
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	conf := p.fsm.pConf.ReadCopy()
+	conf.Config.PeerAs = 65001
+	conf.Config.PeerType = oc.PEER_TYPE_EXTERNAL
+	p.fsm.pConf.Update(&conf)
+	require.NotPanics(t, func() { initializeConn(p.fsm, rc) })
 }
 
 // A NOTIFICATION that Established sends for an operation or an admin state
