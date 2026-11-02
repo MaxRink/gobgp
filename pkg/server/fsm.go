@@ -1745,6 +1745,59 @@ func readAll(conn net.Conn, length int) ([]byte, error) {
 	return buf, nil
 }
 
+// newConnectionOpenTimeout bounds the wait for the OPEN of a connection that
+// arrives while the session is established.
+const newConnectionOpenTimeout = 5 * time.Second
+
+// replayConn replays the bytes of the OPEN that established() read before it
+// handed the connection to active().
+type replayConn struct {
+	net.Conn
+	pending []byte
+}
+
+func (c *replayConn) Read(p []byte) (int, error) {
+	if len(c.pending) > 0 {
+		n := copy(p, c.pending)
+		c.pending = c.pending[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+// readOpen reads the OPEN that the peer sends first on conn and returns it
+// with its wire bytes, so the connection can replay them.
+func readOpen(conn net.Conn, timeout time.Duration) (*bgp.BGPMessage, []byte, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, nil, err
+	}
+	defer conn.SetReadDeadline(time.Time{})
+	header, err := readAll(conn, bgp.BGP_HEADER_LENGTH)
+	if err != nil {
+		return nil, nil, err
+	}
+	h := &bgp.BGPHeader{}
+	if err := h.DecodeFromBytes(header); err != nil {
+		return nil, nil, err
+	}
+	if h.Type != bgp.BGP_MSG_OPEN {
+		return nil, nil, fmt.Errorf("first message is not OPEN")
+	}
+	if h.Len < bgp.BGP_HEADER_LENGTH || int(h.Len) > bgp.BGP_MAX_MESSAGE_LENGTH {
+		return nil, nil, fmt.Errorf("invalid OPEN length %d", h.Len)
+	}
+	body, err := readAll(conn, int(h.Len)-bgp.BGP_HEADER_LENGTH)
+	if err != nil {
+		return nil, nil, err
+	}
+	raw := append(header, body...)
+	m, err := bgp.ParseBGPMessage(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, raw, nil
+}
+
 func getPathAttrFromBGPUpdate(m *bgp.BGPUpdate, typ bgp.BGPAttrType) bgp.PathAttributeInterface {
 	for _, a := range m.PathAttributes {
 		if a.GetType() == typ {
@@ -2634,13 +2687,20 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			if !ok {
 				break
 			}
-			n := fsm.grNegotiated()
-			// A helper-only peer advertises its families with F=0. It did
-			// not preserve forwarding state, so a new connection from it is
-			// a collision, not a restart: closing the established session
-			// for it drops the just-recovered session a second time (FRR
-			// leaves in the production template lab).
-			if !n.HasForwardingState() {
+			// Whether this is a restart is a property of the new OPEN, not
+			// of the established session: a peer may have started with F=0
+			// and later restart with forwarding state preserved. A
+			// helper-only peer (FRR leaf) advertises F=0 and zero LLGR
+			// stale time, so its late connection stays a collision.
+			open, raw, err := readOpen(conn, newConnectionOpenTimeout)
+			if err != nil {
+				conn.Close()
+				fsm.logger.Warn("Closed an accepted connection",
+					slog.String("State", fsm.state.String()),
+					slog.Any("Error", err))
+				break
+			}
+			if !gr.ForwardingStateFromOpen(open) {
 				conn.Close()
 				fsm.logger.Warn("Closed an accepted connection", slog.String("State", fsm.state.String()))
 				break
@@ -2672,9 +2732,10 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			// logic introduced by GR." We read this as: the families in
 			// the Long-Lived Graceful Restart Capability count too.
 			fsm.conn.Close()
-			// active() takes the connection. idle() would close it.
+			// active() takes the connection. idle() would close it. The
+			// wrapper replays the OPEN that established() read.
 			select {
-			case fsm.connCh <- conn:
+			case fsm.connCh <- &replayConn{Conn: conn, pending: raw}:
 			default:
 				// Another connection from the peer is queued. active()
 				// takes that one.

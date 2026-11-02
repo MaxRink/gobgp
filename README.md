@@ -77,10 +77,10 @@ license text.
 This branch is upstream GoBGP master at 629e5ae8 (2026-11-01, after
 v4.11.0) with the fixes and features that BOOTy needs and upstream does
 not have yet, released as the tags `v4.11.0-booty.N` from
-`v4.11.0-booty.3` on. The tag `v4.11.0-booty.1` is the same tree without
-the forwarding-state gate for a new connection; `v4.11.0-booty.2` had the
-gate but let the LLGR F bit override the GR F bit, which FRR helper-only
-leaves always set. The tags
+`v4.11.0-booty.4` on. The tag `v4.11.0-booty.1` is the same tree without
+the forwarding-state gate for a new connection; `v4.11.0-booty.2` checked
+the established session's F bit, and `v4.11.0-booty.3` let the LLGR F bit
+override the GR F bit. The tags
 `v4.10.0-booty.23` and `v4.10.0-booty.24` were on upstream master
 6d26fa29, `v4.10.0-booty.17` to `v4.10.0-booty.22` on 57fa92f1, and
 `v4.10.0-booty.1` to `v4.10.0-booty.16` on the branch `booty/v4.10`
@@ -104,11 +104,14 @@ The fork keeps what upstream still lacks:
   restarts: BOOTy disables a peer on carrier loss, and FRR keeps those
   routes in NSF wait across interface down and up;
 - a new connection while the session is established ends the session
-  only for a peer that preserved forwarding state (the GR F bit), not for
-  a helper-only peer that advertises its families with F=0. FRR leaves do
-  that; closing their just-recovered session for a late connection drops
-  it a second time. The GR F bit wins over the LLGR F bit, which FRR
-  always sets.
+  only when the new OPEN says that the peer preserved forwarding state.
+  The GR F bit wins per family; an LLGR tuple counts only for a family
+  that the GR capability does not list and only with a nonzero stale time.
+  A helper-only FRR leaf advertises GR F=0 and LLGR F=1 with stale time
+  zero, so its late connection stays a collision; closing the just-
+  recovered session for it drops it a second time. The decision reads the
+  new OPEN, not the established session's capability, so a peer that
+  started with F=0 can still restart with forwarding state preserved.
 
 The fork drops the fixes that upstream has merged: EVPN NLRIs of unknown
 route types (#3742), the EVPN ARP/ND extended community (#3746), the

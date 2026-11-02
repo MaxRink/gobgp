@@ -61,27 +61,56 @@ func (n *Negotiated) HasFamilies() bool {
 	return len(n.grFamilies()) > 0 || len(n.llgrTuples()) > 0
 }
 
-// HasForwardingState reports whether the peer preserved forwarding state for
-// at least one family (the F bit of RFC 4724 Section 3 or RFC 9494 Section 3).
-// A helper-only peer advertises its families with F=0: a new connection from
-// it while the session is established is a connection collision, not a
-// restart, and its routes cannot be used without its forwarding state.
+// ForwardingStateFromOpen reports whether the OPEN of a peer that opens a new
+// connection while the session is established says that the peer preserved
+// forwarding state. Only such a peer is restarting; otherwise the new
+// connection is a late collision and the established session must stay.
 //
-// When the Graceful Restart Capability lists families, their F bit is
-// authoritative. FRR always sets the LLGR F bit, also for a helper-only peer,
-// so the LLGR tuple must not override the GR tuple of the same family. Only a
-// peer with LLGR families and no GR families is judged by its LLGR F bit.
-func (n *Negotiated) HasForwardingState() bool {
-	if gr := n.grFamilies(); len(gr) > 0 {
-		for _, preserved := range gr {
-			if preserved {
-				return true
-			}
-		}
+// The GR F bit wins per family. An LLGR tuple counts only for a family that
+// the GR capability does not list, and only with a nonzero stale time: FRR
+// helper-only peers always set the LLGR F bit but advertise stale time zero,
+// which preserves no routes.
+func ForwardingStateFromOpen(open *bgp.BGPMessage) bool {
+	if open == nil || open.Header.Type != bgp.BGP_MSG_OPEN {
 		return false
 	}
-	for _, t := range n.llgrTuples() {
-		if t.Flags&fBit != 0 {
+	body, ok := open.Body.(*bgp.BGPOpen)
+	if !ok {
+		return false
+	}
+	grForward := make(map[bgp.Family]bool)
+	llgr := make(map[bgp.Family]*bgp.CapLongLivedGracefulRestartTuple)
+	for _, p := range body.OptParams {
+		param, ok := p.(*bgp.OptionParameterCapability)
+		if !ok {
+			continue
+		}
+		for _, c := range param.Capability {
+			switch c := c.(type) {
+			case *bgp.CapGracefulRestart:
+				// RFC 4724 Section 3: ignore all but the last instance.
+				clear(grForward)
+				for _, t := range c.Tuples {
+					grForward[bgp.NewFamily(t.AFI, t.SAFI)] = t.Flags&fBit != 0
+				}
+			case *bgp.CapLongLivedGracefulRestart:
+				clear(llgr)
+				for _, t := range c.Tuples {
+					llgr[bgp.NewFamily(t.AFI, t.SAFI)] = t
+				}
+			}
+		}
+	}
+	for _, preserved := range grForward {
+		if preserved {
+			return true
+		}
+	}
+	for f, t := range llgr {
+		if _, ok := grForward[f]; ok {
+			continue
+		}
+		if t.Flags&fBit != 0 && t.RestartTime > 0 {
 			return true
 		}
 	}

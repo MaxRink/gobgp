@@ -2940,22 +2940,35 @@ func TestFSMHandlerEstablished_NoGracefulRestartAfterCapabilityRemoved(t *testin
 // connection is closed as a collision.
 func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 	tests := []struct {
-		name string
-		caps []bgp.ParameterCapabilityInterface
-		ends bool
+		name    string
+		caps    []bgp.ParameterCapabilityInterface // the new OPEN
+		session []bgp.ParameterCapabilityInterface // the established session, caps if nil
+		ends    bool
 	}{
 		{"graceful restart", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
 				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, true),
 			}),
-		}, true},
+		}, nil, true},
 		{"graceful restart without forwarding state", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
 				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, false),
 			}),
-		}, false},
+		}, nil, false},
+		// The established session started without forwarding state; the
+		// new OPEN says the peer restarted with it. The new OPEN decides.
+		{"normal startup then preserved restart", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
+				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, true),
+			}),
+		}, []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
+				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, false),
+			}),
+		}, true},
 		// FRR helper-only leaves set the LLGR F bit, but the GR F bit of
-		// the same family is clear. The GR F bit must win.
+		// the same family is clear and the LLGR stale time is zero. The GR
+		// F bit wins and zero retention keeps the session.
 		{"helper-only with LLGR forwarding bit", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
 				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, false),
@@ -2963,28 +2976,42 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
 				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv4_UC, true, 0),
 			}),
-		}, false},
+		}, nil, false},
 		{"long-lived graceful restart only", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 0, nil),
 			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
 				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv4_UC, true, 3600),
 			}),
-		}, true},
+		}, nil, true},
 		{"long-lived graceful restart without forwarding state", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 0, nil),
 			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
 				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv4_UC, false, 3600),
 			}),
-		}, false},
+		}, nil, false},
+		// GR precedence is per family: IPv4 has no preserved state, but
+		// IPv6 is LLGR-only with a nonzero stale time.
+		{"mixed families", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
+				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, false),
+			}),
+			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
+				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv6_UC, true, 3600),
+			}),
+		}, nil, true},
 		{"no family in the capability", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 120, nil),
-		}, false},
-		{"no graceful restart", nil, false},
+		}, nil, false},
+		{"no graceful restart", nil, nil, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p, h, m := grFirstSession(t)
-			p.fsm.recvOpen = grOpen(t, tt.caps...)
+			session := tt.session
+			if session == nil {
+				session = tt.caps
+			}
+			p.fsm.recvOpen = grOpen(t, session...)
 			p.fsm.stateChange(bgp.BGP_FSM_ESTABLISHED, newfsmStateReason(fsmOpenMsgNegotiated, nil, nil))
 
 			type result struct {
@@ -3001,6 +3028,10 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 
 			conn, remote := net.Pipe()
 			t.Cleanup(func() { remote.Close() })
+			open := grOpen(t, tt.caps...)
+			raw, err := open.Serialize()
+			require.NoError(t, err)
+			go func() { _, _ = remote.Write(raw) }()
 			p.fsm.connCh <- conn
 
 			if !tt.ends {
@@ -3022,15 +3053,20 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 			}
 			assert.Equal(t, bgp.BGP_FSM_ACTIVE, r.state)
 			assert.Equal(t, fsmNewConnection, r.reason.Type)
-			// active() takes the new connection.
+			// active() takes the new connection, with its OPEN replayed.
 			select {
 			case c := <-p.fsm.connCh:
-				assert.Equal(t, conn, c)
+				rc, ok := c.(*replayConn)
+				require.True(t, ok, "connection is %T, not *replayConn", c)
+				assert.Equal(t, conn, rc.Conn)
+				replayed, err := io.ReadAll(io.LimitReader(rc, int64(len(raw))))
+				require.NoError(t, err)
+				assert.Equal(t, raw, replayed)
 			default:
 				t.Fatal("the new connection is not passed to active()")
 			}
 			// The old connection is closed without a NOTIFICATION.
-			_, err := m.Write([]byte{0})
+			_, err = m.Write([]byte{0})
 			assert.ErrorIs(t, err, io.ErrClosedPipe)
 			for _, b := range m.GetSentMessages() {
 				msg, err := bgp.ParseBGPMessage(b)
