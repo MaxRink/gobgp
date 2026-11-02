@@ -77,9 +77,10 @@ license text.
 This branch is upstream GoBGP master at 629e5ae8 (2026-11-01, after
 v4.11.0) with the fixes and features that BOOTy needs and upstream does
 not have yet, released as the tags `v4.11.0-booty.N` from
-`v4.11.0-booty.1` on. The tags `v4.10.0-booty.17` to `v4.10.0-booty.24`
-were on upstream master 6d26fa29, and `v4.10.0-booty.1` to
-`v4.10.0-booty.16` on the branch `booty/v4.10` (based on v4.10.0). The
+`v4.11.0-booty.1` on. The tags `v4.10.0-booty.23` and `v4.10.0-booty.24`
+were on upstream master 6d26fa29, `v4.10.0-booty.17` to `v4.10.0-booty.22`
+on 57fa92f1, and `v4.10.0-booty.1` to `v4.10.0-booty.16` on the branch
+`booty/v4.10` (based on v4.10.0). The
 old commits stay reachable through their tags. Do not use
 `v4.10.0-booty.7`: it stops answering a NOTIFICATION in OpenSent, which
 RFC 4271 Section 8.2.2 does not allow.
