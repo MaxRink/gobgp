@@ -66,11 +66,19 @@ func (n *Negotiated) HasFamilies() bool {
 // A helper-only peer advertises its families with F=0: a new connection from
 // it while the session is established is a connection collision, not a
 // restart, and its routes cannot be used without its forwarding state.
+//
+// When the Graceful Restart Capability lists families, their F bit is
+// authoritative. FRR always sets the LLGR F bit, also for a helper-only peer,
+// so the LLGR tuple must not override the GR tuple of the same family. Only a
+// peer with LLGR families and no GR families is judged by its LLGR F bit.
 func (n *Negotiated) HasForwardingState() bool {
-	for _, preserved := range n.grFamilies() {
-		if preserved {
-			return true
+	if gr := n.grFamilies(); len(gr) > 0 {
+		for _, preserved := range gr {
+			if preserved {
+				return true
+			}
 		}
+		return false
 	}
 	for _, t := range n.llgrTuples() {
 		if t.Flags&fBit != 0 {

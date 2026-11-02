@@ -77,8 +77,10 @@ license text.
 This branch is upstream GoBGP master at 629e5ae8 (2026-11-01, after
 v4.11.0) with the fixes and features that BOOTy needs and upstream does
 not have yet, released as the tags `v4.11.0-booty.N` from
-`v4.11.0-booty.2` on. The tag `v4.11.0-booty.1` is the same tree without
-the forwarding-state gate for a new connection. The tags
+`v4.11.0-booty.3` on. The tag `v4.11.0-booty.1` is the same tree without
+the forwarding-state gate for a new connection; `v4.11.0-booty.2` had the
+gate but let the LLGR F bit override the GR F bit, which FRR helper-only
+leaves always set. The tags
 `v4.10.0-booty.23` and `v4.10.0-booty.24` were on upstream master
 6d26fa29, `v4.10.0-booty.17` to `v4.10.0-booty.22` on 57fa92f1, and
 `v4.10.0-booty.1` to `v4.10.0-booty.16` on the branch `booty/v4.10`
@@ -102,10 +104,11 @@ The fork keeps what upstream still lacks:
   restarts: BOOTy disables a peer on carrier loss, and FRR keeps those
   routes in NSF wait across interface down and up;
 - a new connection while the session is established ends the session
-  only for a peer that preserved forwarding state (the F bit), not for a
-  helper-only peer that advertises its families with F=0. FRR leaves do
+  only for a peer that preserved forwarding state (the GR F bit), not for
+  a helper-only peer that advertises its families with F=0. FRR leaves do
   that; closing their just-recovered session for a late connection drops
-  it a second time.
+  it a second time. The GR F bit wins over the LLGR F bit, which FRR
+  always sets.
 
 The fork drops the fixes that upstream has merged: EVPN NLRIs of unknown
 route types (#3742), the EVPN ARP/ND extended community (#3746), the

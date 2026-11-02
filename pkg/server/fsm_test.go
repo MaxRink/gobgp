@@ -2954,6 +2954,16 @@ func TestFSMHandlerEstablished_NewConnection(t *testing.T) {
 				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, false),
 			}),
 		}, false},
+		// FRR helper-only leaves set the LLGR F bit, but the GR F bit of
+		// the same family is clear. The GR F bit must win.
+		{"helper-only with LLGR forwarding bit", []bgp.ParameterCapabilityInterface{
+			bgp.NewCapGracefulRestart(false, false, 120, []*bgp.CapGracefulRestartTuple{
+				bgp.NewCapGracefulRestartTuple(bgp.RF_IPv4_UC, false),
+			}),
+			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
+				bgp.NewCapLongLivedGracefulRestartTuple(bgp.RF_IPv4_UC, true, 0),
+			}),
+		}, false},
 		{"long-lived graceful restart only", []bgp.ParameterCapabilityInterface{
 			bgp.NewCapGracefulRestart(false, false, 0, nil),
 			bgp.NewCapLongLivedGracefulRestart([]*bgp.CapLongLivedGracefulRestartTuple{
