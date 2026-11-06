@@ -2395,6 +2395,8 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			choiceTimer = time.After(collisionChoiceWait)
 		case <-choiceTimer:
 			// The peer did not choose: resolve as Section 6.8 says.
+			fsm.logger.Info("no choice from the peer in a collision, closing the incoming connection",
+				slog.Duration("Waited", collisionChoiceWait))
 			if err := takePending(collisionCease()); err != nil {
 				return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmWriteFailed, nil, nil)
 			}
