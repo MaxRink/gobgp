@@ -315,6 +315,80 @@ func TestCollisionPeerEstablishedOnIncoming(t *testing.T) {
 	}
 }
 
+// The mirror case: GoBGP is in OpenConfirm on the peer's connection (B) and
+// its OPEN is out on its own connection (A), when the peer's KEEPALIVE
+// arrives on B (the peer sent it for GoBGP's OPEN on B). The peer then gets
+// GoBGP's OPEN on A while B is in OpenConfirm, keeps A and closes B (RFC
+// 4271 Section 6.8, GoBGP has the higher BGP Identifier). Before, GoBGP went
+// Established on B at the KEEPALIVE and closed A with Cease/Connection
+// Collision Resolution, so both were gone (BOOTy lab: Peer Up, then the
+// peer's Cease on B in Established).
+func TestCollisionPeerKeepsOursAfterKeepaliveOnIncoming(t *testing.T) {
+	ctx := t.Context()
+	lc := &net.ListenConfig{}
+	peerL, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { peerL.Close() })
+	l, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	gobgpPort := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+
+	s := NewBgpServer()
+	go s.Serve()
+	require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{
+		Asn: 65001, RouterId: "192.0.2.17", ListenPort: int32(gobgpPort), ListenAddresses: []string{"127.0.0.1"},
+	}}))
+	t.Cleanup(func() { _ = s.StopBgp(context.Background(), &api.StopBgpRequest{}) })
+	p := &scriptedPeer{t: t, asn: 65002, id: netip.MustParseAddr("10.0.0.1")}
+	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
+	require.NoError(t, s.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
+		Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 65002},
+		Transport: &api.Transport{RemotePort: uint32(peerL.Addr().(*net.TCPAddr).Port)},
+		Timers:    &api.Timers{Config: &api.TimersConfig{ConnectAtOnce: true, IdleHoldTimeAfterReset: 1}},
+	}}))
+
+	a, err := peerL.Accept()
+	require.NoError(t, err)
+	defer a.Close()
+	p.expect(a, bgp.BGP_MSG_OPEN) // GoBGP's OPEN is out on A
+	b, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(gobgpPort)))
+	require.NoError(t, err)
+	defer b.Close()
+	p.write(b, p.open())
+	p.expect(b, bgp.BGP_MSG_OPEN)
+	p.expect(b, bgp.BGP_MSG_KEEPALIVE) // GoBGP is in OpenConfirm on B
+	p.write(b, bgp.NewBGPKeepAliveMessage())
+	time.Sleep(100 * time.Millisecond) // GoBGP has the KEEPALIVE on B
+	// The peer processes GoBGP's OPEN on A: it keeps A, closes B.
+	oa, err := p.open().Serialize()
+	require.NoError(t, err)
+	ka, err := bgp.NewBGPKeepAliveMessage().Serialize()
+	require.NoError(t, err)
+	_, _ = a.Write(append(oa, ka...))
+	n, err := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil).Serialize()
+	require.NoError(t, err)
+	_, _ = b.Write(n)
+	b.Close()
+
+	m := p.read(a)
+	require.Equal(t, uint8(bgp.BGP_MSG_KEEPALIVE), m.Header.Type, "GoBGP closed the connection the peer keeps: %v", m.Body)
+	w.Wait(t, 5*time.Second)
+	require.NoError(t, a.SetReadDeadline(time.Now().Add(time.Second)))
+	hdr := make([]byte, bgp.BGP_HEADER_LENGTH)
+	for {
+		_, err := io.ReadFull(a, hdr)
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			break
+		}
+		require.NoError(t, err, "GoBGP closed the connection the peer keeps")
+		require.NotEqual(t, uint8(bgp.BGP_MSG_NOTIFICATION), hdr[18], "GoBGP closed the connection the peer keeps")
+		_, err = io.CopyN(io.Discard, a, int64(binary.BigEndian.Uint16(hdr[16:18]))-bgp.BGP_HEADER_LENGTH)
+		require.NoError(t, err)
+	}
+}
+
 // When the connection that survived a collision fails too, both are gone:
 // GoBGP starts again after IdleHoldTimeAfterReset (1 s here), not after the
 // idle hold time that the NOTIFICATION backs off to (2 s).

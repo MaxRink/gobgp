@@ -325,6 +325,21 @@ type outgoingConnManager struct {
 	// such a manager. It is cleared when the dial fails or the manager
 	// connects again.
 	dialing atomic.Bool
+	// lostOpenSent gets a value when the connection on which the OPEN
+	// was sent fails before the peer's OPEN arrived on it.
+	lostOpenSent chan struct{}
+	// handedOver is set before the connection goes to outgoingConnCh.
+	handedOver atomic.Bool
+}
+
+// leaveOpenSent goes back to Connect after the connection on which the OPEN
+// was sent failed, and tells openconfirm() (lostOpenSent).
+func (ocm *outgoingConnManager) leaveOpenSent() {
+	ocm.state.Store(bgp.BGP_FSM_CONNECT)
+	select {
+	case ocm.lostOpenSent <- struct{}{}:
+	default:
+	}
 }
 
 // newOutGoingConnManager starts a manager that connects to the peer after
@@ -332,9 +347,10 @@ type outgoingConnManager struct {
 func newOutGoingConnManager(ctx context.Context, fsm *fsm, delay time.Duration) *outgoingConnManager {
 	cctx, cancel := context.WithCancel(ctx)
 	ocm := &outgoingConnManager{
-		ctx:    cctx,
-		cancel: cancel,
-		fsm:    fsm,
+		ctx:          cctx,
+		cancel:       cancel,
+		fsm:          fsm,
+		lostOpenSent: make(chan struct{}, 1),
 	}
 	ocm.state.Store(bgp.BGP_FSM_CONNECT)
 	ocm.wg.Add(1)
@@ -397,7 +413,7 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, delay time.Duration)
 			conn.SetWriteDeadline(time.Now().Add(time.Second))
 			if _, err := conn.Write(b); err != nil {
 				conn.Close()
-				ocm.state.Store(bgp.BGP_FSM_CONNECT)
+				ocm.leaveOpenSent()
 				continue
 			}
 			fsm.bgpMessageStateUpdate(bgp.BGP_MSG_OPEN, false)
@@ -416,7 +432,7 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, delay time.Duration)
 				// sendNotification closes the connection
 				_ = fsm.sendNotification(conn, notif)
 				wg.Wait()
-				ocm.state.Store(bgp.BGP_FSM_CONNECT)
+				ocm.leaveOpenSent()
 				continue
 			case <-ocm.ctx.Done():
 				holdTimer.Stop()
@@ -433,7 +449,7 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, delay time.Duration)
 				fsm.logger.Debug("outgoing connection IO error", slog.String("reason", reason.String()))
 				conn.Close()
 				wg.Wait()
-				ocm.state.Store(bgp.BGP_FSM_CONNECT)
+				ocm.leaveOpenSent()
 				continue
 			case fmsg := <-recvCh:
 				holdTimer.Stop()
@@ -445,10 +461,11 @@ func (ocm *outgoingConnManager) run(ch chan<- outgoingConn, delay time.Duration)
 					} else {
 						conn.Close()
 					}
-					ocm.state.Store(bgp.BGP_FSM_CONNECT)
+					ocm.leaveOpenSent()
 					continue
 				}
 				fsm.logger.Debug("open message received on outgoing connection", slog.String("remote", conn.RemoteAddr().String()))
+				ocm.handedOver.Store(true)
 				ch <- outgoingConn{
 					conn: conn,
 					open: fmsg.MsgData.(*bgp.BGPMessage),
@@ -2274,6 +2291,9 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 		pendingReasonCh chan fsmStateReason
 		pendingWg       *sync.WaitGroup
 		choiceTimer     <-chan time.Time
+		// set while the KEEPALIVE on the incoming connection waits for
+		// the outcome of our own connection, on which the OPEN was sent
+		lostOpenSent <-chan struct{}
 		// the peer's KEEPALIVE arrived on the incoming connection
 		keepaliveRecv bool
 	)
@@ -2384,6 +2404,7 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			// lower BGP Identifier, chooses: a NOTIFICATION or close on
 			// one connection, or its KEEPALIVE on ours. Follow it.
 			fsm.logger.Debug("collision detected: dominant on active side, wait for the peer's choice")
+			lostOpenSent = nil
 			pending = &result
 			pendingCh = make(chan *fsmMsg, 1)
 			pendingReasonCh = make(chan fsmStateReason, 1)
@@ -2393,7 +2414,17 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			// ponytail: fixed wait; a peer that chooses later than this
 			// gets the plain Section 6.8 resolution again.
 			choiceTimer = time.After(collisionChoiceWait)
+		case <-lostOpenSent:
+			// The peer closed our connection: it kept the incoming one.
+			return bgp.BGP_FSM_ESTABLISHED, newfsmStateReason(fsmOpenMsgNegotiated, nil, nil)
 		case <-choiceTimer:
+			if pending == nil {
+				// Our connection is still in OpenSent: go on with
+				// the incoming one, as before.
+				fsm.logger.Info("no choice from the peer in a collision, keeping the incoming connection",
+					slog.Duration("Waited", collisionChoiceWait))
+				return bgp.BGP_FSM_ESTABLISHED, newfsmStateReason(fsmOpenMsgNegotiated, nil, nil)
+			}
 			// The peer did not choose: resolve as Section 6.8 says.
 			fsm.logger.Info("no choice from the peer in a collision, closing the incoming connection",
 				slog.Duration("Waited", collisionChoiceWait))
@@ -2448,6 +2479,25 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 			case *bgp.BGPMessage:
 				switch m.Header.Type {
 				case bgp.BGP_MSG_KEEPALIVE:
+					if ocm := fsm.outgoingConnMgr; ocm != nil && fsm.isDominant(fsm.recvOpen.Body.(*bgp.BGPOpen)) {
+						// Drop a value of an earlier connection.
+						select {
+						case <-ocm.lostOpenSent:
+						default:
+						}
+						if len(fsm.outgoingConnCh) > 0 || (ocm.state.Load() == bgp.BGP_FSM_OPENSENT && !ocm.handedOver.Load()) {
+							// Our OPEN is out on our own connection
+							// too (its answer may be queued). The peer
+							// may keep that one when it gets the OPEN
+							// there and close this one (it sent this
+							// KEEPALIVE before): wait for its choice,
+							// as above.
+							keepaliveRecv = true
+							lostOpenSent = ocm.lostOpenSent
+							choiceTimer = time.After(collisionChoiceWait)
+							continue
+						}
+					}
 					return bgp.BGP_FSM_ESTABLISHED, newfsmStateReason(fsmOpenMsgNegotiated, nil, nil)
 				case bgp.BGP_MSG_NOTIFICATION:
 					// RFC 4271 8.2.2, OpenConfirm state: "If the local
