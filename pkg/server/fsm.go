@@ -1134,8 +1134,9 @@ type fsmHandler struct {
 	// collided is set when OpenSent or OpenConfirm resolved a collision
 	// (RFC 4271 Section 6.8). When the connection that was kept fails too,
 	// both are gone, and loop() caps the next idle hold time at
-	// idle-hold-time-after-reset. Active clears it. Only the handler
-	// goroutine uses it.
+	// idle-hold-time-after-reset. Idle and Established clear it; Active
+	// keeps it, for the collision that opensent() resolves by going to
+	// Active. Only the handler goroutine uses it.
 	collided bool
 }
 
@@ -1473,7 +1474,6 @@ func (h *fsmHandler) connectLoop(ctx context.Context, delay time.Duration, diali
 
 func (h *fsmHandler) active(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
-	h.collided = false
 
 	// A connection that the last manager left in outgoingConnCh is taken
 	// below; a new manager would open another one to the peer (with
@@ -2167,6 +2167,21 @@ func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReaso
 					fsm.recvOpen = outConn.open
 					fsm.lock.Unlock()
 				}
+			} else if ocm := fsm.outgoingConnMgr; ocm != nil && ocm.state.Load() == bgp.BGP_FSM_OPENSENT && !ocm.handedOver.Load() && fsm.isDominant(m.Body.(*bgp.BGPOpen)) {
+				// Our OPEN is out on our own connection, which Section
+				// 6.8 keeps, and the peer's OPEN there has not arrived
+				// yet. Like FRR (bgp_collision_detect also examines
+				// connections in OpenSent), close this one now, before
+				// our KEEPALIVE goes out on it. FRR stops a connection
+				// that it closed for a collision only with a queued
+				// event (bgp_write_notify), so a KEEPALIVE that is
+				// already there can still make it Established, and then
+				// it closes ours too. active() takes our connection when
+				// the peer's OPEN arrives on it.
+				h.collided = true
+				notif := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil)
+				fsm.sendLoserNotification(fsm.conn, notif)
+				return bgp.BGP_FSM_ACTIVE, newfsmStateReason(fsmNotificationSent, notificationBody(notif), nil)
 			}
 
 			b, _ := bgp.NewBGPKeepAliveMessage().Serialize()
@@ -3086,6 +3101,7 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 			}
 			h.collided = false
 		case bgp.BGP_FSM_ESTABLISHED:
+			h.collided = false
 			fsm.idleHoldBackoff = idleHoldTimeInitial
 			// The manager may still run: it sent its OPEN before the
 			// incoming connection got the peer's OPEN, so opensent() did

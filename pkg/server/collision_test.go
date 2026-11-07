@@ -141,7 +141,14 @@ func TestCollisionResolvedByGoBGPKeepsSurvivingConnection(t *testing.T) {
 			if tt.openConfirm {
 				p.write(b, p.open())
 				p.expect(b, bgp.BGP_MSG_OPEN)
-				p.expect(b, bgp.BGP_MSG_KEEPALIVE) // GoBGP is in OpenConfirm on B
+				if tt.dominant {
+					// GoBGP's OPEN is out on A, which it keeps: like FRR,
+					// it closes B at once instead of going to OpenConfirm
+					// there.
+					requireCollisionCease(t, p.expect(b, bgp.BGP_MSG_NOTIFICATION))
+				} else {
+					p.expect(b, bgp.BGP_MSG_KEEPALIVE) // GoBGP is in OpenConfirm on B
+				}
 				if tt.frr {
 					oa, err := p.open().Serialize()
 					require.NoError(t, err)
@@ -149,7 +156,9 @@ func TestCollisionResolvedByGoBGPKeepsSurvivingConnection(t *testing.T) {
 					require.NoError(t, err)
 					_, err = a.Write(append(oa, ka...))
 					require.NoError(t, err)
-					p.write(b, bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil))
+					n, err := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil).Serialize()
+					require.NoError(t, err)
+					_, _ = b.Write(n) // GoBGP may have closed B already
 					b.Close()
 				} else {
 					p.write(a, p.open())
@@ -169,6 +178,7 @@ func TestCollisionResolvedByGoBGPKeepsSurvivingConnection(t *testing.T) {
 			}
 			if !tt.frr && (keep == a || !tt.openConfirm) {
 				// GoBGP's KEEPALIVE on B in OpenConfirm was read above.
+				// With FRR timing, the peer sent its KEEPALIVE already.
 				p.expect(keep, bgp.BGP_MSG_KEEPALIVE)
 			}
 			if !tt.frr {
@@ -248,145 +258,171 @@ func TestCollisionSimultaneousOpenFRRTiming(t *testing.T) {
 	}
 }
 
-// FRR after a carrier fault (BOOTy production template lab): the peer's
-// connection (B) completes first, GoBGP sends OPEN and KEEPALIVE there and
-// the peer goes Established on B. Then GoBGP's own connection (A)
-// completes: the peer answers with its OPEN and, Established already,
-// closes A with Cease/Connection Collision Resolution (RFC 4271 Section
-// 6.8, bgp_collision_detect of FRR). GoBGP has the higher BGP Identifier,
-// but must keep B. Before, it closed B when the OPEN on A arrived, so both
-// connections were gone and the peer counted a second session for one
-// fault (TestProdTplOneDropPerFault: dropped 2).
-func TestCollisionPeerEstablishedOnIncoming(t *testing.T) {
-	ctx := t.Context()
-	lc := &net.ListenConfig{}
-	peerL, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { peerL.Close() })
-	l, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	gobgpPort := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
+// openconfirmResult runs h.openconfirm() in the background.
+func openconfirmResult(t *testing.T, h *fsmHandler) <-chan bgp.FSMState {
+	t.Helper()
+	done := make(chan bgp.FSMState, 1)
+	go func() {
+		state, _ := h.openconfirm(t.Context())
+		done <- state
+	}()
+	return done
+}
 
-	s := NewBgpServer()
-	go s.Serve()
-	require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{
-		Asn: 65001, RouterId: "192.0.2.17", ListenPort: int32(gobgpPort), ListenAddresses: []string{"127.0.0.1"},
-	}}))
-	t.Cleanup(func() { _ = s.StopBgp(context.Background(), &api.StopBgpRequest{}) })
-	p := &scriptedPeer{t: t, asn: 65002, id: netip.MustParseAddr("10.0.0.1")}
-	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
-	require.NoError(t, s.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
-		Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 65002},
-		Transport: &api.Transport{RemotePort: uint32(peerL.Addr().(*net.TCPAddr).Port)},
-		Timers:    &api.Timers{Config: &api.TimersConfig{ConnectAtOnce: true, IdleHoldTimeAfterReset: 1}},
-	}}))
-
-	a, err := peerL.Accept()
-	require.NoError(t, err)
-	defer a.Close()
-	p.expect(a, bgp.BGP_MSG_OPEN)
-	b, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(gobgpPort)))
-	require.NoError(t, err)
-	defer b.Close()
-	p.write(b, p.open())
-	p.expect(b, bgp.BGP_MSG_OPEN)
-	p.expect(b, bgp.BGP_MSG_KEEPALIVE) // the peer is Established on B
-	p.write(a, p.open())
-	time.Sleep(100 * time.Millisecond) // GoBGP has the OPEN on A
-	p.write(a, bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil))
-	a.Close()
-	p.write(b, bgp.NewBGPKeepAliveMessage())
-	w.Wait(t, 5*time.Second)
-
-	// GoBGP stays on B: nothing but UPDATEs and KEEPALIVEs there.
-	require.NoError(t, b.SetReadDeadline(time.Now().Add(time.Second)))
-	hdr := make([]byte, bgp.BGP_HEADER_LENGTH)
-	for {
-		_, err := io.ReadFull(b, hdr)
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			break
-		}
-		require.NoError(t, err, "GoBGP closed the connection the peer is Established on")
-		require.NotEqual(t, uint8(bgp.BGP_MSG_NOTIFICATION), hdr[18], "GoBGP closed the connection the peer is Established on")
-		_, err = io.CopyN(io.Discard, b, int64(binary.BigEndian.Uint16(hdr[16:18]))-bgp.BGP_HEADER_LENGTH)
-		require.NoError(t, err)
+func requireState(t *testing.T, done <-chan bgp.FSMState, want bgp.FSMState) {
+	t.Helper()
+	select {
+	case got := <-done:
+		require.Equal(t, want, got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the FSM state function did not return")
 	}
 }
 
-// The mirror case: GoBGP is in OpenConfirm on the peer's connection (B) and
-// its OPEN is out on its own connection (A), when the peer's KEEPALIVE
-// arrives on B (the peer sent it for GoBGP's OPEN on B). The peer then gets
-// GoBGP's OPEN on A while B is in OpenConfirm, keeps A and closes B (RFC
-// 4271 Section 6.8, GoBGP has the higher BGP Identifier). Before, GoBGP went
-// Established on B at the KEEPALIVE and closed A with Cease/Connection
-// Collision Resolution, so both were gone (BOOTy lab: Peer Up, then the
-// peer's Cease on B in Established).
-func TestCollisionPeerKeepsOursAfterKeepaliveOnIncoming(t *testing.T) {
-	ctx := t.Context()
-	lc := &net.ListenConfig{}
-	peerL, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { peerL.Close() })
-	l, err := lc.Listen(ctx, "tcp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	gobgpPort := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
-
-	s := NewBgpServer()
-	go s.Serve()
-	require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{Global: &api.Global{
-		Asn: 65001, RouterId: "192.0.2.17", ListenPort: int32(gobgpPort), ListenAddresses: []string{"127.0.0.1"},
-	}}))
-	t.Cleanup(func() { _ = s.StopBgp(context.Background(), &api.StopBgpRequest{}) })
-	p := &scriptedPeer{t: t, asn: 65002, id: netip.MustParseAddr("10.0.0.1")}
-	w := newPeerStateWaiter(s, api.PeerState_SESSION_STATE_ESTABLISHED)
-	require.NoError(t, s.AddPeer(ctx, &api.AddPeerRequest{Peer: &api.Peer{
-		Conf:      &api.PeerConf{NeighborAddress: "127.0.0.1", PeerAsn: 65002},
-		Transport: &api.Transport{RemotePort: uint32(peerL.Addr().(*net.TCPAddr).Port)},
-		Timers:    &api.Timers{Config: &api.TimersConfig{ConnectAtOnce: true, IdleHoldTimeAfterReset: 1}},
-	}}))
-
-	a, err := peerL.Accept()
-	require.NoError(t, err)
-	defer a.Close()
-	p.expect(a, bgp.BGP_MSG_OPEN) // GoBGP's OPEN is out on A
-	b, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(gobgpPort)))
-	require.NoError(t, err)
-	defer b.Close()
-	p.write(b, p.open())
-	p.expect(b, bgp.BGP_MSG_OPEN)
-	p.expect(b, bgp.BGP_MSG_KEEPALIVE) // GoBGP is in OpenConfirm on B
-	p.write(b, bgp.NewBGPKeepAliveMessage())
-	time.Sleep(100 * time.Millisecond) // GoBGP has the KEEPALIVE on B
-	// The peer processes GoBGP's OPEN on A: it keeps A, closes B.
-	oa, err := p.open().Serialize()
-	require.NoError(t, err)
-	ka, err := bgp.NewBGPKeepAliveMessage().Serialize()
-	require.NoError(t, err)
-	_, _ = a.Write(append(oa, ka...))
-	n, err := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil).Serialize()
-	require.NoError(t, err)
-	_, _ = b.Write(n)
-	b.Close()
-
-	m := p.read(a)
-	require.Equal(t, uint8(bgp.BGP_MSG_KEEPALIVE), m.Header.Type, "GoBGP closed the connection the peer keeps: %v", m.Body)
-	w.Wait(t, 5*time.Second)
-	require.NoError(t, a.SetReadDeadline(time.Now().Add(time.Second)))
-	hdr := make([]byte, bgp.BGP_HEADER_LENGTH)
-	for {
-		_, err := io.ReadFull(a, hdr)
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			break
-		}
-		require.NoError(t, err, "GoBGP closed the connection the peer keeps")
-		require.NotEqual(t, uint8(bgp.BGP_MSG_NOTIFICATION), hdr[18], "GoBGP closed the connection the peer keeps")
-		_, err = io.CopyN(io.Discard, a, int64(binary.BigEndian.Uint16(hdr[16:18]))-bgp.BGP_HEADER_LENGTH)
+// requireNoNotification checks that GoBGP did not close m with a
+// NOTIFICATION.
+func requireNoNotification(t *testing.T, m *MockConnection) {
+	t.Helper()
+	for _, buf := range m.GetSentMessages() {
+		msg, err := bgp.ParseBGPMessage(buf)
 		require.NoError(t, err)
+		require.NotEqual(t, uint8(bgp.BGP_MSG_NOTIFICATION), msg.Header.Type, "GoBGP closed the connection that the peer keeps")
 	}
+}
+
+// dominantOpenconfirmHandler is GoBGP with the higher BGP Identifier in OpenConfirm on
+// the incoming connection: it got the peer's OPEN there and sent its
+// KEEPALIVE.
+func dominantOpenconfirmHandler(t *testing.T) (*peer, *fsmHandler, *MockConnection, *bgp.BGPMessage) {
+	t.Helper()
+	incoming := NewMockConnection()
+	p, h := makePeerAndHandler(incoming)
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	p.fsm.gConf.Config.RouterId = netip.MustParseAddr("192.0.2.17")
+	open, err := bgp.NewBGPOpenMessage(65002, 90, netip.MustParseAddr("10.0.0.1"), nil)
+	require.NoError(t, err)
+	p.fsm.recvOpen = open
+	return p, h, incoming, open
+}
+
+// FRR after a carrier fault (BOOTy production template lab): GoBGP's OPEN
+// went out on its own connection after its KEEPALIVE on the peer's one, and
+// the peer, Established on its connection, closes GoBGP's with
+// Cease/Connection Collision Resolution (RFC 4271 Section 6.8, collision
+// with an Established connection). GoBGP must keep the incoming connection.
+// It used to close that one when the peer's OPEN arrived on its own
+// connection, so both were gone and the peer counted a second session
+// (TestProdTplOneDropPerFault: dropped 2).
+func TestOpenconfirmCollisionPeerEstablishedOnIncoming(t *testing.T) {
+	p, h, incoming, open := dominantOpenconfirmHandler(t)
+	outgoing := NewMockConnection()
+	t.Cleanup(func() { outgoing.Close() })
+	p.fsm.outgoingConnCh <- outgoingConn{conn: outgoing, open: open}
+
+	done := openconfirmResult(t, h)
+	time.Sleep(50 * time.Millisecond) // openconfirm() has our connection
+	go outgoing.PushBgpMessage(bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil))
+	time.Sleep(50 * time.Millisecond)
+	go incoming.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
+
+	requireState(t, done, bgp.BGP_FSM_ESTABLISHED)
+	require.Same(t, incoming, p.fsm.conn)
+	requireNoNotification(t, incoming)
+	require.Empty(t, outgoing.GetSentMessages(), "GoBGP answered on the connection that the peer closed")
+}
+
+// The same, but the peer keeps GoBGP's connection: its KEEPALIVE arrives
+// there. GoBGP goes on with it and closes the incoming one.
+func TestOpenconfirmCollisionPeerKeepsOurs(t *testing.T) {
+	p, h, incoming, open := dominantOpenconfirmHandler(t)
+	outgoing := NewMockConnection()
+	t.Cleanup(func() { outgoing.Close() })
+	p.fsm.outgoingConnCh <- outgoingConn{conn: outgoing, open: open}
+
+	done := openconfirmResult(t, h)
+	time.Sleep(50 * time.Millisecond)
+	go outgoing.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
+
+	requireState(t, done, bgp.BGP_FSM_ESTABLISHED)
+	require.Same(t, outgoing, p.fsm.conn)
+	requireCollisionCease(t, sentMessage(t, incoming, 0))
+	require.Equal(t, uint8(bgp.BGP_MSG_KEEPALIVE), sentMessage(t, outgoing, 0).Header.Type)
+}
+
+// The mirror case: the peer's KEEPALIVE arrives on the incoming connection
+// while GoBGP's OPEN is out on its own connection (the manager is in
+// OpenSent). The peer sent that KEEPALIVE for GoBGP's OPEN; when it then
+// gets GoBGP's OPEN on the other connection while the incoming one is in
+// OpenConfirm, it keeps GoBGP's connection. GoBGP used to go Established at
+// the KEEPALIVE and close its own connection, so both were gone (BOOTy lab:
+// Peer Up, then the peer's Cease in Established).
+func TestOpenconfirmKeepaliveWaitsForOurConnection(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// the peer keeps GoBGP's connection; otherwise it closes it
+		keepsOurs bool
+	}{
+		{"peer keeps ours", true},
+		{"peer closes ours", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p, h, incoming, open := dominantOpenconfirmHandler(t)
+			ocm := &outgoingConnManager{fsm: p.fsm, lostOpenSent: make(chan struct{}, 1)}
+			ocm.state.Store(bgp.BGP_FSM_OPENSENT)
+			p.fsm.outgoingConnMgr = ocm
+
+			done := openconfirmResult(t, h)
+			go incoming.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
+			select {
+			case <-done:
+				t.Fatal("Established at the KEEPALIVE on the incoming connection while our OPEN is out")
+			case <-time.After(100 * time.Millisecond):
+			}
+			if !tt.keepsOurs {
+				ocm.leaveOpenSent()
+				requireState(t, done, bgp.BGP_FSM_ESTABLISHED)
+				require.Same(t, incoming, p.fsm.conn)
+				requireNoNotification(t, incoming)
+				return
+			}
+			outgoing := NewMockConnection()
+			t.Cleanup(func() { outgoing.Close() })
+			ocm.handedOver.Store(true)
+			p.fsm.outgoingConnCh <- outgoingConn{conn: outgoing, open: open}
+			time.Sleep(50 * time.Millisecond)
+			go outgoing.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
+			requireState(t, done, bgp.BGP_FSM_ESTABLISHED)
+			require.Same(t, outgoing, p.fsm.conn)
+			requireCollisionCease(t, sentMessage(t, incoming, 0))
+		})
+	}
+}
+
+// GoBGP's OPEN is out on its own connection (the manager is in OpenSent)
+// when the peer's OPEN arrives on the incoming connection, and GoBGP has the
+// higher BGP Identifier. Like FRR (bgp_collision_detect examines OpenSent
+// connections too), GoBGP closes the incoming connection at once and does
+// not send its KEEPALIVE there: FRR stops a connection that it closed for a
+// collision only with a queued event, so a KEEPALIVE already there still
+// made it Established, and it then closed GoBGP's connection too.
+func TestOpensentCollisionWithOurOpenSent(t *testing.T) {
+	incoming := NewMockConnection()
+	p, h := makePeerAndHandler(incoming)
+	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
+	p.fsm.opensentHoldTime = 10
+	p.fsm.gConf.Config.RouterId = netip.MustParseAddr("192.0.2.17")
+	ocm := &outgoingConnManager{fsm: p.fsm}
+	ocm.state.Store(bgp.BGP_FSM_OPENSENT)
+	p.fsm.outgoingConnMgr = ocm
+
+	open, err := bgp.NewBGPOpenMessage(65002, 90, netip.MustParseAddr("10.0.0.1"), nil)
+	require.NoError(t, err)
+	go incoming.PushBgpMessage(open)
+	state, _ := h.opensent(t.Context())
+	require.Equal(t, bgp.BGP_FSM_ACTIVE, state)
+	require.Len(t, incoming.GetSentMessages(), 1, "GoBGP sent more than the NOTIFICATION")
+	requireCollisionCease(t, sentMessage(t, incoming, 0))
+	require.True(t, h.collided)
 }
 
 // When the connection that survived a collision fails too, both are gone:
@@ -425,9 +461,8 @@ func TestCollisionBothConnectionsDropped(t *testing.T) {
 	defer b.Close()
 	p.write(b, p.open())
 	p.expect(b, bgp.BGP_MSG_OPEN)
-	p.expect(b, bgp.BGP_MSG_KEEPALIVE) // OpenConfirm on B
+	p.expect(b, bgp.BGP_MSG_NOTIFICATION) // GoBGP keeps A, its OPEN is out there
 	p.write(a, p.open())
-	p.expect(b, bgp.BGP_MSG_NOTIFICATION) // GoBGP keeps A
 	p.expect(a, bgp.BGP_MSG_KEEPALIVE)
 	// The peer drops A as well.
 	p.write(a, bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_CONNECTION_COLLISION_RESOLUTION, nil))

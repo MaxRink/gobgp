@@ -5166,6 +5166,9 @@ func TestDeferralTimerStoppedOnSessionDown(t *testing.T) {
 // established on the incoming connection first. The manager used to keep
 // running: it connected again and again while the session was established.
 // Now its connection is closed with Cease/Connection Collision Resolution.
+// The peer has the higher BGP Identifier, so GoBGP keeps the incoming
+// connection (with the lower one it closes that at once, see
+// TestCollisionBothConnectionsDropped).
 func TestOutgoingConnClosedOnEstablished(t *testing.T) {
 	const (
 		asn      = 65001
@@ -5202,7 +5205,20 @@ func TestOutgoingConnClosedOnEstablished(t *testing.T) {
 	t.Cleanup(func() { out.Close() })
 	require.Equal(t, uint8(bgp.BGP_MSG_OPEN), readMessage(t, out).Header.Type)
 
-	establishSession(t, s, peer, asn, peerAddr)
+	m := NewMockConnection()
+	m.SetRemoteAddr(peerAddr)
+	t.Cleanup(func() { m.Close() })
+	peer.fsm.connCh <- m
+	openMsg, err := bgp.NewBGPOpenMessage(uint16(asn), 90, netip.MustParseAddr("192.168.1.9"),
+		[]bgp.OptionParameterInterface{
+			bgp.NewOptionParameterCapability([]bgp.ParameterCapabilityInterface{
+				bgp.NewCapMultiProtocol(bgp.RF_IPv4_UC),
+			}),
+		})
+	require.NoError(t, err)
+	m.PushBgpMessage(openMsg)
+	m.PushBgpMessage(bgp.NewBGPKeepAliveMessage())
+	waitPeerState(t, s, api.PeerState_SESSION_STATE_ESTABLISHED, 10*time.Second)
 
 	requireCollisionCease(t, readMessage(t, out))
 
